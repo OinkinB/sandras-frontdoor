@@ -98,3 +98,17 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
             "size": [W, H]}
     (out_dir / f"{pid}.json").write_text(json.dumps(meta))
     return meta
+
+
+def crop_pair(out_dir: Path, rid: str) -> tuple[bytes, bytes]:
+    """Before/after crops around an edit (with some context) for the quality check."""
+    meta = json.loads((out_dir / f"{rid}.json").read_text())
+    before = Image.open(out_dir / f"{rid}_before.jpg").convert("RGB")
+    after = Image.open(out_dir / f"{rid}_after.jpg").convert("RGB")
+    W, H = before.size
+    x0, y0, x1, y1 = meta["rect"]
+    pad_x, pad_y = (x1 - x0) * 0.15, (y1 - y0) * 0.15
+    box = (int(max(0, x0 - pad_x) * W), int(max(0, y0 - pad_y) * H), int(min(1, x1 + pad_x) * W), int(min(1, y1 + pad_y) * H))
+    def jp(im):
+        im = im.crop(box); im.thumbnail((900, 900)); return _jpeg(im, 88)
+    return jp(before), jp(after)

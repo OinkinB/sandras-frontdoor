@@ -60,6 +60,8 @@ def _img_part(mime, data):
 def _gemini(prompt, images, want_json):
     parts = [_img_part(m, b) for m, b in images] + [{"text": prompt}]
     cfg = {"temperature": 0.3}
+    if GEMINI_MODEL.startswith("gemini-3"):     # these tasks need quick judgement, not long deliberation
+        cfg["thinkingConfig"] = {"thinkingLevel": os.environ.get("GEMINI_THINKING", "low")}
     if want_json:
         cfg["responseMimeType"] = "application/json"
     out = _gemini_raw(GEMINI_MODEL, parts, cfg)
@@ -160,20 +162,59 @@ At most 2 changes. Costs must be realistic for 2026. Never claim ADA compliance;
     return _as_obj(ask(prompt, imgs), "changes")
 
 
-def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, instruction: str = "") -> dict:
-    """First-pass agent: look at a few views of the home and pick the changes this user needs."""
+def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, instruction: str = "",
+               outlined: bool = False, existing: list | None = None) -> dict:
+    """Agent: find what to change. With an instruction it targets the object the user means (the magenta outline,
+    if present, only marks roughly where they pointed)."""
+    target = ""
+    if instruction:
+        target = (f'THE USER ASKED: "{instruction}". Find the existing object they mean and propose exactly that change, '
+                  "following their wishes on details. ")
+        if outlined:
+            target += ("A magenta outline in the photo marks roughly where they pointed; it may be loose or partial. "
+                       "box_2d must enclose the WHOLE object to change (e.g. the entire tub and its surround), not the outline. ")
     prompt = f"""You are an accessibility agent touring a home for a buyer. Buyer: {persona or 'not described'}; needs: {needs}.
 You get {len(views)} photos from the home's 3D tour (image i is view i; rooms: {rooms}).
-{('THE USER ASKED: "' + instruction + '". Find the existing object in the photo they mean and propose exactly that change (follow their wishes on details).') if instruction else ''}
+{target}
+Changes already planned in this home (do not repeat them): {json.dumps(existing or [])}
 Find the concrete EXISTING barriers for THIS buyer and the change that fixes each: bathtub or curbed shower -> curbless
 roll-in shower, toilet without support -> grab bars beside it, stairs -> stairlift, narrow door -> wider door, step at
 entry -> ramp, carpet -> hard floor, high counters/cabinets -> roll-under. Always fix an existing object you can see;
-never invent a new fixture in empty floor space. Ignore reflections in mirrors, glass and windows: only real objects. box_2d must tightly enclose that existing object (for a tub: the whole
-tub and its surround), large enough to show the result.
-Return JSON {{"findings":[{{"view": int, "box_2d":[ymin,xmin,ymax,xmax] on a 0-1000 scale tightly around the thing to change,
-  "item": str, "issue": str, "action":"remove"|"add"|"replace","title":str,"reason":str, {OPTIONS_SPEC}}}]}}
+never invent a new fixture in empty floor space. Ignore reflections in mirrors, glass and windows: only real objects.
+box_2d must enclose that existing object (for a tub: the whole tub and its surround) with a little margin.
+Return JSON {{"findings":[{{"view": int, "box_2d":[ymin,xmin,ymax,xmax] on a 0-1000 scale,
+  "item": str, "issue": str, "action":"remove"|"add"|"replace","title":str,"reason":str,
+  "fits_needs": true|false (does this help the buyer's stated needs?),
+  "advice": str (one friendly sentence: why it matters, or a gentle warning if it is an extra that adds cost without helping their needs),
+  {OPTIONS_SPEC}}}]}}
 At most one finding per view; skip views with nothing important. At most {min(4, len(views))} findings, most important first."""
     return _as_obj(ask(prompt, [("image/jpeg", v) for v in views]), "findings")
+
+
+def verify_render(before: bytes, after: bytes, task: str) -> dict:
+    """Quality gate: does the edited photo really show the requested change, finished and believable?"""
+    prompt = f"""You are a strict reviewer of photo edits for a home-remodel visualizer.
+Image 1 = the original photo region, image 2 = the edited region. The requested change was:
+"{task}"
+Judge only what a home buyer would see. Fail it if: the requested change is missing or only partly done, the old item
+is still clearly there when it should be gone, it looks like a construction site, there are smears, warped geometry,
+floating objects, duplicated fixtures, cut-off items at the edges, or obvious seams.
+Return JSON {{"ok": true|false, "score": 0-10, "issues": [str], "fix": str (one concrete instruction to fix it, or "")}}.
+ok must be true only if score >= 7."""
+    imgs = [("image/jpeg", before), ("image/jpeg", after)]
+    errors = []
+    # OpenAI reviews first (an independent model from the one that drew it); Gemini as fallback
+    for fn, ok in ((_openai, os.environ.get("OPENAI_API_KEY")), (_gemini, os.environ.get("GCP_PROJECT"))):
+        if not ok:
+            continue
+        try:
+            text = fn(prompt, imgs, True).strip().removeprefix("```json").removeprefix("```").removesuffix("```")
+            res = _as_obj(json.loads(text), "issues")
+            res["reviewer"] = fn.__name__.strip("_")
+            return res
+        except Exception as e:
+            errors.append(f"{fn.__name__}: {e}")
+    return {"ok": True, "score": None, "issues": [], "fix": "", "reviewer": "unavailable", "error": "; ".join(errors)[:300]}
 
 
 def chat(home: dict, edits: list, selection: dict | None, message: str, history: list) -> dict:

@@ -156,7 +156,8 @@ def render(home_id):
         f = out_dir / f"{b['ref']}_ref.png"
         ref = f.read_bytes() if f.exists() else None
     try:
-        meta = imaging.render(_b64img(b["image"]), b["rect"], b["task"], out_dir, ref, b.get("poly"))
+        task = b["task"] + (f" IMPORTANT FIX from review of the previous attempt: {b['fix']}" if b.get("fix") else "")
+        meta = imaging.render(_b64img(b["image"]), b["rect"], task, out_dir, ref, b.get("poly"))
     except Exception as e:
         current_app.logger.error("Render error on %s: %s", request.path, e)
         return jsonify({"error": f"Render failed: {e}"[:300]}), 502
@@ -175,6 +176,25 @@ def render_file(home_id, rid, kind):
                     headers={"Cache-Control": "max-age=604800"})
 
 
+@bp.post("/home/<int:home_id>/verify")
+def verify(home_id):
+    """Quality check of a finished render: compares before/after around the edited area."""
+    _home(home_id)
+    b = request.get_json(force=True)
+    rid = b.get("rid", "")
+    if not re.fullmatch(r"[0-9a-f]{12}", rid):
+        abort(400)
+    d = _renders_dir(home_id)
+    try:
+        before, after = imaging.crop_pair(d, rid)
+        res = ai.verify_render(before, after, b.get("task", ""))
+    except Exception as e:
+        current_app.logger.error("Verify error: %s", e)
+        res = {"ok": True, "score": None, "issues": [], "fix": "", "error": str(e)[:200]}
+    current_app.logger.info("verify %s -> %s", rid, res)
+    return jsonify(res)
+
+
 @bp.post("/home/<int:home_id>/agent/plan")
 def agent_plan(home_id):
     """First pass: the agent looks at views from rooms that matter and proposes changes for this buyer."""
@@ -183,7 +203,7 @@ def agent_plan(home_id):
     views = [_b64img(v["image"]) for v in b.get("views") or []][:8]
     try:
         res = ai.agent_plan(views, [v.get("room", "") for v in b.get("views") or []], b.get("needs") or [], b.get("persona", ""),
-                           b.get("instruction", ""))
+                           b.get("instruction", ""), bool(b.get("outlined")), b.get("existing") or [])
     except Exception as e:
         current_app.logger.error("AI error on %s: %s", request.path, e)
         return jsonify({"error": f"AI unavailable: {e}"[:300]}), 502

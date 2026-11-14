@@ -1,116 +1,146 @@
 {% extends "base.html" %}
 {% block title %}{{ home.address }} · Sandra's FrontDoor{% endblock %}
-{% block bodyclass %}xl:h-screen xl:overflow-hidden xl:flex xl:flex-col{% endblock %}
+{% block bodyclass %}lg:h-screen lg:overflow-hidden lg:flex lg:flex-col{% endblock %}
 {% block body %}
-<main class="xl:flex-1 xl:min-h-0 w-full max-w-[1760px] mx-auto p-3 grid xl:grid-cols-[minmax(0,1fr)_440px] gap-3">
-
-  <!-- LEFT: listing bar + tour -->
-  <section class="min-w-0 min-h-0 flex flex-col gap-3">
-    <div class="bg-white rounded-2xl shadow-card px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-2">
-      <a href="javascript:history.back()" class="w-9 h-9 -ml-1 rounded-full hover:bg-slate-100 grid place-items-center" aria-label="Back to results">
-        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M15 6l-6 6 6 6"/></svg></a>
-      <div class="min-w-0">
-        <div class="font-bold text-lg leading-tight truncate">{{ home.address }}</div>
-        <div class="text-sm text-slate-500 truncate">{{ home.city }}, {{ home.state }} {{ home.zip or '' }} · {{ home.beds or '–' }} bd · {{ home.baths or '–' }} ba · {{ '{:,}'.format(home.sqft) if home.sqft else '—' }} sq ft{% if home.year_built %} · {{ home.year_built }}{% endif %}</div>
+<!-- Listing bar -->
+<div class="bg-white border-b border-slate-200/80 shrink-0">
+  <div class="max-w-[1760px] mx-auto px-4 h-[68px] flex items-center gap-5">
+    <a href="javascript:history.back()" class="w-9 h-9 -ml-1 rounded-full hover:bg-slate-100 grid place-items-center shrink-0" aria-label="Back to results">
+      <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M15 6l-6 6 6 6"/></svg></a>
+    <div class="min-w-0">
+      <div class="font-bold text-lg leading-tight truncate">{{ home.address }}</div>
+      <div class="text-sm text-slate-500 truncate">{{ home.city }}, {{ home.state }} {{ home.zip or '' }}</div>
+    </div>
+    <div class="hidden md:block h-9 w-px bg-slate-200"></div>
+    <div class="text-xl font-extrabold" id="c-price"></div>
+    <div class="hidden xl:flex items-center gap-5 text-sm text-slate-600">
+      <span>🛏 {{ home.beds or '–' }} bd</span><span>🛁 {{ home.baths or '–' }} ba</span>
+      <span>⬚ {{ '{:,}'.format(home.sqft) if home.sqft else '—' }} sq ft</span>{% if home.year_built %}<span>Built {{ home.year_built }}</span>{% endif %}
+    </div>
+    <div class="ml-auto flex items-center gap-2">
+      <div class="hidden md:block text-right mr-2">
+        <div class="text-[11px] uppercase tracking-wide font-semibold text-slate-500">With your changes</div>
+        <div class="font-extrabold"><span id="c-true"></span> <span id="budget" class="text-xs font-semibold"></span></div>
       </div>
-      <div class="ml-auto flex items-end gap-3 text-right">
-        <div><div class="text-[11px] text-slate-500 uppercase tracking-wide font-semibold">{{ 'Rent' if home.rent else 'Price' }}</div><div class="font-bold text-lg" id="c-price"></div></div>
-        <div class="text-slate-300 text-lg pb-0.5">+</div>
-        <div><div class="text-[11px] text-slate-500 uppercase tracking-wide font-semibold">Changes</div><div class="font-bold text-lg text-brand-700" id="c-mods">$0</div></div>
-        <div class="text-slate-300 text-lg pb-0.5">=</div>
-        <div class="bg-brand-50 rounded-xl px-3 py-1"><div class="text-[11px] text-brand-700 uppercase tracking-wide font-semibold">True cost</div><div class="font-extrabold text-lg" id="c-true"></div></div>
+      <button data-drawer="changes" class="flex items-center gap-2 border border-slate-300 rounded-xl px-3.5 py-2 text-sm font-semibold hover:border-brand-500">
+        Changes <span id="plan-count" class="text-xs bg-brand-100 text-brand-700 rounded-full px-1.5">0</span></button>
+      <button id="agent-run" class="bg-brand-600 hover:bg-brand-700 text-white rounded-xl px-4 py-2 text-sm font-semibold">✦ Guided tour</button>
+    </div>
+  </div>
+</div>
+
+<main class="lg:flex-1 lg:min-h-0 w-full max-w-[1760px] mx-auto p-3 grid lg:grid-cols-[minmax(0,1fr)_400px] lg:grid-rows-[minmax(0,1fr)_auto] gap-3">
+
+  <!-- 3D tour: always the center of the page -->
+  <section class="relative min-h-[460px] h-[64vh] lg:h-auto rounded-2xl overflow-hidden bg-slate-900 shadow-card" id="stage">
+    <iframe id="showcase" class="absolute inset-0 w-full h-full" allow="xr-spatial-tracking; fullscreen"></iframe>
+    <div id="overlay" class="absolute inset-0 z-10" style="pointer-events:none"></div>
+    <div id="photos" class="absolute inset-0 hidden z-20 bg-slate-900/95 overflow-y-auto scroll-thin p-3 pt-16 grid grid-cols-2 md:grid-cols-3 gap-2 content-start">
+      {% for p in photos %}<img src="{{ p }}" alt="" loading="lazy" class="w-full aspect-[4/3] object-cover rounded-lg">{% endfor %}
+    </div>
+
+    <!-- top bar -->
+    <div class="absolute top-3 left-3 right-3 z-30 flex flex-wrap items-start gap-2 pointer-events-none">
+      <div class="pointer-events-auto flex bg-white/95 shadow rounded-full p-1 text-sm font-semibold">
+        <button data-view="tour" class="view-tab px-4 py-1.5 rounded-full bg-brand-600 text-white">3D tour</button>
+        <button data-view="photos" class="view-tab px-4 py-1.5 rounded-full">Photos</button>
+        <button data-drawer="outside" class="px-4 py-1.5 rounded-full hover:bg-slate-100">Outside</button>
+      </div>
+      <div id="room-nav" class="hidden pointer-events-auto relative">
+        <div class="flex items-center bg-white/95 shadow rounded-full text-sm font-semibold">
+          <button id="room-prev" class="w-9 h-9 grid place-items-center rounded-full hover:bg-slate-100" aria-label="Previous room">‹</button>
+          <button id="room-name" class="px-1 min-w-[7.5rem]" title="Jump to a room">Rooms</button>
+          <button id="room-next" class="w-9 h-9 grid place-items-center rounded-full hover:bg-slate-100" aria-label="Next room">›</button>
+        </div>
+        <div id="room-menu" class="hidden absolute top-11 left-0 w-56 max-h-72 overflow-y-auto scroll-thin bg-white shadow-xl text-sm rounded-xl p-1.5"></div>
+      </div>
+      <div class="ml-auto pointer-events-auto flex items-center gap-2" id="tour-tools">
+        <button id="compare" class="flex items-center gap-2 bg-white/95 shadow rounded-full pl-1.5 pr-3.5 py-1 text-sm font-semibold" title="Show the home with or without your changes (hold B to peek)">
+          <span id="compare-dot" class="w-9 h-6 rounded-full bg-brand-600 relative transition"><span class="absolute top-0.5 right-0.5 w-5 h-5 rounded-full bg-white shadow transition"></span></span>
+          <span id="compare-label">Your changes on</span></button>
       </div>
     </div>
 
-    <div class="relative flex-1 min-h-[420px] h-[62vh] xl:h-auto rounded-2xl overflow-hidden bg-slate-900 shadow-card" id="stage">
-      <iframe id="showcase" class="absolute inset-0 w-full h-full" allow="xr-spatial-tracking; fullscreen"></iframe>
-      <div id="overlay" class="absolute inset-0 z-10" style="pointer-events:none"></div>
-      <img id="aerial" alt="Aerial view of the lot" class="absolute inset-0 w-full h-full object-contain bg-slate-900 hidden z-20">
-      <div id="photos" class="absolute inset-0 hidden z-20 bg-slate-900 overflow-y-auto scroll-thin p-3 grid grid-cols-2 md:grid-cols-3 gap-2 content-start">
-        {% for p in photos %}<img src="{{ p }}" alt="" loading="lazy" class="w-full aspect-[4/3] object-cover rounded-lg">{% endfor %}
-      </div>
+    <!-- processing window -->
+    <div id="jobs" class="absolute top-16 right-3 z-30 w-80 space-y-2 pointer-events-auto"></div>
 
-      <div class="absolute top-3 left-3 right-3 z-30 flex flex-wrap items-start gap-2 pointer-events-none">
-        <div class="pointer-events-auto flex bg-black/50 backdrop-blur rounded-full p-1 text-sm font-medium text-white" role="tablist">
-          <button data-view="tour" class="view-tab px-4 py-1.5 rounded-full bg-white text-ink">3D tour</button>
-          <button data-view="aerial" class="view-tab px-4 py-1.5 rounded-full">Aerial</button>
-          <button data-view="photos" class="view-tab px-4 py-1.5 rounded-full">Photos</button>
-        </div>
-        <div id="room-nav" class="hidden pointer-events-auto relative">
-          <div class="flex items-center bg-black/50 text-white rounded-full backdrop-blur text-sm font-medium">
-            <button id="room-prev" class="w-9 h-9 grid place-items-center rounded-full hover:bg-white/15" aria-label="Previous room">‹</button>
-            <button id="room-name" class="px-1 min-w-[7rem]" title="Jump to a room">Rooms</button>
-            <button id="room-next" class="w-9 h-9 grid place-items-center rounded-full hover:bg-white/15" aria-label="Next room">›</button>
-          </div>
-          <div id="room-menu" class="hidden absolute top-11 left-0 w-56 max-h-72 overflow-y-auto scroll-thin bg-black/80 text-white text-sm rounded-xl p-1.5 backdrop-blur"></div>
-        </div>
-        <div class="ml-auto pointer-events-auto flex items-center gap-2" id="tour-tools">
-          <div class="flex bg-black/50 backdrop-blur rounded-full p-1 text-sm font-medium text-white">
-            <button id="ba-orig" class="px-3.5 py-1.5 rounded-full" title="The home as it is today">Today</button>
-            <button id="ba-before" class="px-3.5 py-1.5 rounded-full" title="Outlines of planned changes">Plan</button>
-            <button id="ba-after" class="px-3.5 py-1.5 rounded-full bg-white text-ink" title="The home with your changes">After</button>
-          </div>
-        </div>
+    <!-- drawers that slide over the tour -->
+    <aside data-drawer-panel="changes" class="drawer">
+      <div class="drawer-head"><div class="font-bold">Your changes</div><button id="undo" class="ml-auto text-xs font-semibold border rounded-lg px-2 py-1 hover:bg-slate-50" title="Undo the last change (Ctrl+Z)">↶ Undo</button><button data-close class="drawer-x" aria-label="Close">✕</button></div>
+      <ul id="plan" class="flex-1 min-h-0 overflow-y-auto scroll-thin p-3 space-y-2"></ul>
+      <div class="border-t p-3 text-sm shrink-0">
+        <div class="flex justify-between text-slate-500"><span>Labor included</span><span id="plan-labor">$0</span></div>
+        <div class="flex justify-between font-bold text-base"><span>Total for changes on</span><span id="plan-total">$0</span></div>
+        <button id="plan-clear" class="mt-1 text-xs text-slate-400 hover:text-red-600">Remove all</button>
       </div>
+    </aside>
+    <aside data-drawer-panel="access" class="drawer">
+      <div class="drawer-head"><div class="font-bold">Accessibility details</div><button data-close class="drawer-x ml-auto" aria-label="Close">✕</button></div>
+      <div class="flex-1 min-h-0 overflow-y-auto scroll-thin p-3"><ul id="evidence" class="space-y-2"></ul>
+        <h3 class="font-semibold mt-5 text-xs text-slate-500 uppercase tracking-wide">Rooms in the scan</h3><div id="rooms" class="mt-1 text-sm"></div></div>
+    </aside>
+    <aside data-drawer-panel="outside" class="drawer">
+      <div class="drawer-head"><div class="font-bold">Outside the home</div><button data-close class="drawer-x ml-auto" aria-label="Close">✕</button></div>
+      <div class="flex-1 min-h-0 overflow-y-auto scroll-thin p-3">
+        <div class="relative rounded-xl overflow-hidden bg-slate-100 aspect-square"><img id="aerial-thumb" alt="Aerial view of the lot" class="absolute inset-0 w-full h-full object-cover scale-[1.35]"></div>
+        <div class="text-xs text-slate-500 mt-1">Aerial photo (Vexcel). The home is outlined in gold.</div>
+        <dl id="outside" class="mt-3 grid grid-cols-2 gap-2 text-sm"></dl>
+      </div>
+    </aside>
 
-      <!-- primary action: big, obvious select toggle -->
-      <div id="tool-pick" class="hidden absolute bottom-[4.25rem] right-4 z-30 flex bg-black/60 backdrop-blur rounded-full p-1 text-xs font-semibold">
-        <button data-tool-pick="lasso" class="px-3 py-1.5 rounded-full bg-white text-ink">✎ Draw</button>
-        <button data-tool-pick="box" class="px-3 py-1.5 rounded-full text-white">▢ Box</button>
-      </div>
-      <div class="absolute bottom-4 right-4 z-30 flex bg-white rounded-full shadow-lg p-1 text-sm font-semibold">
-        <button id="mode-walk" class="px-4 py-2 rounded-full bg-ink text-white" title="Walk around (W)">Walk</button>
-        <button id="mode-select" class="px-4 py-2 rounded-full" title="Drag a box around anything to change it (S)">Select to change</button>
-      </div>
-      <div id="render-status" class="hidden absolute top-16 right-3 z-30 bg-brand-600 text-white text-sm px-3 py-1.5 rounded-full shadow animate-pulse"></div>
-      <div id="hint" class="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 bg-black/65 text-white text-sm px-4 py-2 rounded-full backdrop-blur pointer-events-none transition-opacity text-center">Loading 3D tour…</div>
+    <!-- select controls -->
+    <div id="tool-pick" class="hidden absolute bottom-[4.25rem] right-4 z-30 flex bg-white/95 shadow rounded-full p-1 text-xs font-semibold">
+      <button data-tool-pick="lasso" class="px-3 py-1.5 rounded-full bg-ink text-white">✎ Draw</button>
+      <button data-tool-pick="box" class="px-3 py-1.5 rounded-full">▢ Box</button>
     </div>
+    <div class="absolute bottom-4 right-4 z-30 flex bg-white rounded-full shadow-lg p-1 text-sm font-semibold">
+      <button id="mode-walk" class="px-4 py-2 rounded-full bg-ink text-white" title="Walk around (W)">Walk</button>
+      <button id="mode-select" class="px-4 py-2 rounded-full" title="Circle anything to change it (S)">✎ Change something</button>
+    </div>
+    <div id="render-status" class="hidden"></div>
+    <div id="hint" class="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 bg-black/70 text-white text-sm px-4 py-2 rounded-full backdrop-blur pointer-events-none transition-opacity text-center max-w-[80%]">Loading 3D tour…</div>
   </section>
 
-  <!-- RIGHT: agent panel (fixed height, scrolls inside, composer always visible) -->
-  <aside class="bg-white rounded-2xl shadow-card flex flex-col min-h-[560px] xl:min-h-0 overflow-hidden">
-    <div class="px-4 border-b border-slate-200 flex gap-5 overflow-x-auto shrink-0" role="tablist" id="panel-tabs">
-      <button class="tab-btn" data-tab="assistant" aria-selected="true">Agent</button>
-      <button class="tab-btn" data-tab="plan" aria-selected="false">Changes <span id="plan-count" class="text-xs bg-brand-100 text-brand-700 rounded-full px-1.5">0</span></button>
-      <button class="tab-btn" data-tab="access" aria-selected="false">Accessibility</button>
-      <button class="tab-btn" data-tab="outside" aria-selected="false">Outside</button>
+  <!-- AI assistant -->
+  <aside class="bg-white rounded-2xl shadow-card flex flex-col min-h-[520px] lg:min-h-0 lg:row-span-2 overflow-hidden">
+    <div class="px-4 py-3 border-b border-slate-100 flex items-center gap-3 shrink-0">
+      <span class="w-9 h-9 rounded-xl bg-brand-50 text-brand-600 grid place-items-center text-lg">✦</span>
+      <div class="flex-1"><div class="font-bold leading-tight">Your home guide</div><div class="text-xs text-slate-500">Accessibility agent for this home</div></div>
+      <button id="chat-clear" class="text-xs text-slate-500 border rounded-lg px-2 py-1 hover:bg-slate-50">Clear</button>
     </div>
-
-    <section data-panel="assistant" class="flex-1 flex flex-col min-h-0">
-      <div id="chat" class="flex-1 min-h-0 overflow-y-auto scroll-thin px-4 py-4 space-y-3"></div>
-      <div class="p-3 border-t border-slate-100 shrink-0">
-        <div id="sel-chips" class="flex flex-wrap gap-2 mb-2"></div>
-        <div class="flex gap-2 mb-2">
-          <button id="agent-run" class="text-xs font-semibold text-brand-700 bg-brand-50 rounded-full px-3 py-1.5 hover:bg-brand-100">✦ Let the agent check this home</button>
-        </div>
-        <form id="chat-form" class="flex items-center gap-2 border border-slate-200 rounded-2xl px-3 py-1.5 focus-within:border-brand-400">
-          <input id="chat-input" class="flex-1 outline-none py-1.5 text-[15px]" placeholder="Select something, then say what you want…" autocomplete="off">
-          <button class="w-9 h-9 rounded-xl bg-brand-600 text-white grid place-items-center hover:bg-brand-700" aria-label="Send">
-            <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 12l16-8-6 16-2-6z"/></svg></button>
-        </form>
-      </div>
-    </section>
-
-    <section data-panel="plan" class="flex-1 min-h-0 flex flex-col hidden">
-      <ul id="plan" class="flex-1 min-h-0 overflow-y-auto scroll-thin p-4 space-y-2"></ul>
-      <div class="border-t p-4 shrink-0">
-        <div class="flex justify-between text-sm text-slate-500"><span>Labor included</span><span id="plan-labor">$0</span></div>
-        <div class="mt-1 flex justify-between font-bold text-lg"><span>Estimated total</span><span id="plan-total">$0</span></div>
-        <button id="plan-clear" class="mt-2 text-xs text-slate-400 hover:text-red-600">Clear all changes</button>
-      </div>
-    </section>
-
-    <section data-panel="access" class="flex-1 min-h-0 overflow-y-auto scroll-thin p-4 hidden">
-      <ul id="evidence" class="space-y-2"></ul>
-      <h3 class="font-semibold mt-6 text-sm text-slate-500 uppercase tracking-wide">Rooms in the scan</h3>
-      <div id="rooms" class="mt-2 text-sm"></div>
-    </section>
-
-    <section data-panel="outside" class="flex-1 min-h-0 overflow-y-auto scroll-thin p-4 hidden">
-      <img src="/api/home/{{ home.id }}/aerial.jpg" alt="Aerial view" class="w-full rounded-xl bg-slate-100 cursor-zoom-in" id="aerial-thumb">
-      <dl id="outside" class="mt-4 grid grid-cols-2 gap-3 text-sm"></dl>
-    </section>
+    <div id="chat" class="flex-1 min-h-0 overflow-y-auto scroll-thin px-4 py-4 space-y-3"></div>
+    <div class="p-3 border-t border-slate-100 shrink-0">
+      <div id="sel-chips" class="flex flex-wrap gap-2 mb-2"></div>
+      <form id="chat-form" class="flex items-center gap-2 border border-slate-200 rounded-2xl px-3 py-1.5 focus-within:border-brand-400">
+        <input id="chat-input" class="flex-1 outline-none py-1.5 text-[15px]" placeholder="Ask anything, or “make the bathroom wheelchair friendly”" autocomplete="off">
+        <button class="w-9 h-9 rounded-xl bg-brand-600 text-white grid place-items-center hover:bg-brand-700" aria-label="Send">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 12l16-8-6 16-2-6z"/></svg></button>
+      </form>
+    </div>
   </aside>
+
+  <!-- summary strip -->
+  <section class="bg-white rounded-2xl shadow-card px-5 py-3 grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-3 items-center">
+    <div>
+      <div class="text-xs font-semibold text-slate-500">♿ Accessibility score</div>
+      <div class="flex items-baseline gap-2"><span class="text-3xl font-extrabold" id="score">–</span><span class="text-slate-400">/ 100</span><span id="score-tag" class="text-xs font-semibold rounded-full px-2 py-0.5"></span></div>
+      <div class="h-1.5 bg-slate-100 rounded-full mt-1"><div id="score-bar" class="h-1.5 bg-brand-600 rounded-full" style="width:0"></div></div>
+    </div>
+    <div>
+      <div class="text-xs font-semibold text-slate-500">✓ Already accessible</div>
+      <ul id="features" class="text-sm leading-snug mt-0.5"></ul>
+      <button data-drawer="access" class="text-xs font-semibold text-brand-700">View details ›</button>
+    </div>
+    <div>
+      <div class="text-xs font-semibold text-slate-500">🛠 Your upgrades</div>
+      <div class="text-2xl font-extrabold" id="c-mods">$0</div>
+      <button data-drawer="changes" class="text-xs font-semibold text-brand-700">See breakdown ›</button>
+    </div>
+    <div class="flex flex-col gap-1.5">
+      <button id="qa-guided" class="bg-brand-600 hover:bg-brand-700 text-white rounded-lg px-3 py-1.5 text-sm font-semibold">✦ Walk me through it</button>
+      <button id="qa-change" class="border border-slate-300 hover:border-brand-500 rounded-lg px-3 py-1.5 text-sm font-semibold">✎ Change something</button>
+    </div>
+  </section>
 </main>
 {% endblock %}
 {% block scripts %}

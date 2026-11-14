@@ -1,33 +1,38 @@
-/* Sandra's FrontDoor 3D tour.
+/* Sandra's FrontDoor: guided, photoreal remodel preview inside a Matterport tour.
  *
- * Edits are photoreal: the current view is edited by an image model, and the edited region is
- * projected back into the tour as a "photo patch", a textured quad placed along the camera's
- * own rays from the exact scan point it was rendered at. Looking around from that scan point it
- * lines up pixel-for-pixel with the real photo. When you move to another scan point that can see
- * the edit, the agent re-renders it from there (using the first render as a reference so it is
- * the same product), so the change is there wherever you walk.
+ * How a change works
+ *  1. You circle something (loosely is fine) and say what you want, or the guided tour proposes it.
+ *  2. The view and camera pose are frozen at that moment, so you can keep walking while it works.
+ *  3. The agent finds the WHOLE object you meant in that frozen view, picks a product and prices it.
+ *  4. Gemini edits the photo; the edit is projected back into the tour from that exact scan point.
+ *  5. An independent reviewer (OpenAI, Gemini fallback) checks before/after; if it's not a clear, finished,
+ *     believable result it is re-rendered with the reviewer's fix (up to 2 retries).
+ *  6. When ready you get a card with "Show me"; walking to other spots re-renders it from there.
  */
 const H = window.HOME;
 const NEEDS = (new URLSearchParams(location.search).get('needs') || '').split(',').filter(Boolean);
-const STORE = `frontdoor-v2-${H.id}`;
+const STORE = `frontdoor-v3-${H.id}`;
+const BUDGET = (() => { try { return +sessionStorage.getItem('fd-budget') || 0; } catch { return 0; } })();
+const PERSONA = (() => { try { return sessionStorage.getItem('fd-persona') || ''; } catch { return ''; } })();
 const $ = (s, r = document) => r.querySelector(s);
 const money = (n) => '$' + Math.round(n || 0).toLocaleString();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// SDK camera promises can stall during the tour's intro animation; never let the agent hang on one.
-const soon = (p, ms = 4000) => Promise.race([Promise.resolve(p).catch(() => null), sleep(ms)]);
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+const soon = (p, ms = 4000) => Promise.race([Promise.resolve(p).catch(() => null), sleep(ms)]);
+const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
 let sdk = null, info = null;
 let mode = 'walk', view = 'after';
 let poseCache = null, lastSweep = null;
-let selections = [];            // current drag selections
-let edits = [];                 // [{id,title,action,option,cost,world,ref,patches:[{sweep,corners,rid}],agent,on}]
-const live = {};                // editId -> {box: node, patches: {sweepId: node}}
-const pending = new Set();      // `${editId}@${sweep}` renders in flight
+let selections = [];
+let edits = [];
+const live = {};                 // editId -> {patches: {sweepId: node}}
+const selFor = new Map();        // editId -> selection (frozen frame, kept in memory)
+const pending = new Set();
 let chatHistory = [];
-let agentBusy = false;
+let agentBusy = false, agentAbort = false;
 
-/* ---------------- boot ---------------- */
+/* ================= boot ================= */
 const iframe = $('#showcase');
 iframe.src = `/bundle/showcase.html?m=${H.matterport_id}&play=1&qs=1&brand=0&help=0&mls=2&applicationKey=${encodeURIComponent(window.SDK_KEY)}`;
 iframe.addEventListener('load', async () => {
@@ -35,38 +40,20 @@ iframe.addEventListener('load', async () => {
     sdk = await iframe.contentWindow.MP_SDK.connect(iframe.contentWindow);
     await new Promise((res) => { const sub = sdk.App.state.subscribe((s) => { if (s.phase === sdk.App.Phase.PLAYING) { res(); setTimeout(() => sub.cancel()); } }); });
     window.hmSdk = sdk;
-    await setupScene();
+    await sdk.Scene.register('fd.photo', () => new PhotoPatch());
     await loadRooms();
     sdk.Camera.pose.subscribe(onPose);
     await restoreEdits();
-    hint('Press <b>S</b> and drag around anything to change it.', 6000);
-    if (!edits.length && NEEDS.length) offerAgent();
+    hint('Drag to look around. Click <b>✎ Change something</b> to reimagine any spot.', 6000);
+    welcome();
   } catch (e) { console.error(e); hint('3D tour failed to load: ' + (e.message || e)); }
 });
 
-/* ---------------- scene components ---------------- */
-function PlanBox() {             // translucent outline of a planned change (Plan view)
-  this.inputs = { w: 1, h: 1, d: 1, color: 0x22c55e, visible: true };
-  this.onInit = function () {
-    const T = this.context.three, g = new T.BoxGeometry(1, 1, 1);
-    this.mesh = new T.Mesh(g, new T.MeshBasicMaterial({ transparent: true, opacity: 0.18, depthWrite: false }));
-    this.lines = new T.LineSegments(new T.EdgesGeometry(g), new T.LineBasicMaterial());
-    const grp = new T.Group(); grp.add(this.mesh, this.lines);
-    this.outputs.objectRoot = grp; this.apply();
-  };
-  this.apply = function () {
-    const i = this.inputs;
-    for (const o of [this.mesh, this.lines]) { o.scale.set(i.w, i.h, i.d); o.material.color.setHex(i.color); }
-    this.outputs.objectRoot.visible = i.visible;
-  };
-  this.onInputsUpdated = function () { this.apply(); };
-}
-
-function PhotoPatch() {          // generated photo projected along the camera rays it was taken with
+/* ================= photo patches ================= */
+function PhotoPatch() {   // edited photo, projected along the camera rays it was taken with
   this.inputs = { url: '', corners: [], visible: true };
   this.onInit = function () {
-    const T = this.context.three;
-    const c = this.inputs.corners;       // tl, tr, br, bl in world space
+    const T = this.context.three, c = this.inputs.corners;
     const geo = new T.BufferGeometry();
     geo.setAttribute('position', new T.Float32BufferAttribute([c[0], c[1], c[2], c[3]].flatMap((p) => [p.x, p.y, p.z]), 3));
     geo.setAttribute('uv', new T.Float32BufferAttribute([0, 1, 1, 1, 1, 0, 0, 0], 2));
@@ -74,32 +61,22 @@ function PhotoPatch() {          // generated photo projected along the camera r
     const tex = new T.TextureLoader().load(this.inputs.url);
     if ('colorSpace' in tex && T.SRGBColorSpace) tex.colorSpace = T.SRGBColorSpace; else if (T.sRGBEncoding) tex.encoding = T.sRGBEncoding;
     tex.anisotropy = 8;
-    const mat = new T.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, side: T.DoubleSide, toneMapped: false });
-    this.mesh = new T.Mesh(geo, mat); this.mesh.renderOrder = 3000; this.mesh.frustumCulled = false;
+    this.mesh = new T.Mesh(geo, new T.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, side: T.DoubleSide, toneMapped: false }));
+    this.mesh.renderOrder = 3000; this.mesh.frustumCulled = false;
     this.outputs.objectRoot = this.mesh; this.apply();
   };
   this.apply = function () { this.outputs.objectRoot.visible = this.inputs.visible; };
   this.onInputsUpdated = function () { this.apply(); };
 }
-
-async function setupScene() {
-  await sdk.Scene.register('fd.planbox', () => new PlanBox());
-  await sdk.Scene.register('fd.photo', () => new PhotoPatch());
-}
-async function addNode(component, inputs, place) {
+async function addNode(component, inputs) {
   const [obj] = await sdk.Scene.createObjects(1);
-  const n = obj.addNode();
-  n.addComponent(component, inputs);
-  place?.(n);
-  obj.start();
-  return n;
+  const n = obj.addNode(); n.addComponent(component, inputs); obj.start(); return n;
 }
 const comp = (n) => [...n.componentIterator()][0];
 
-/* ---------------- camera math ---------------- */
-// World-space ray direction through a screen pixel for a camera pose (Euler YXZ: yaw then pitch).
-function rayDir(px, py, pose = poseCache) {
-  const W = iframe.clientWidth, Hh = iframe.clientHeight, P = pose.projection;
+/* ================= camera math ================= */
+function rayDir(px, py, pose) {
+  const W = pose.W || iframe.clientWidth, Hh = pose.H || iframe.clientHeight, P = pose.projection;
   const nx = (px / W) * 2 - 1, ny = -((py / Hh) * 2 - 1);
   const x = (nx + (P ? P[8] : 0)) / (P ? P[0] : 1.2), y = (ny + (P ? P[9] : 0)) / (P ? P[5] : 1.2), z = -1;
   const pitch = pose.rotation.x * Math.PI / 180, yaw = pose.rotation.y * Math.PI / 180;
@@ -108,33 +85,31 @@ function rayDir(px, py, pose = poseCache) {
   const L = Math.hypot(x3, y2, z3);
   return { x: x3 / L, y: y2 / L, z: z3 / L };
 }
-function patchCorners(rectN, pose = poseCache, d = 0.6) {
-  const W = iframe.clientWidth, Hh = iframe.clientHeight, c = pose.position;
+function patchCorners(rectN, pose, d = 0.6) {
+  const W = pose.W || iframe.clientWidth, Hh = pose.H || iframe.clientHeight, c = pose.position;
   const fwd = rayDir(W / 2, Hh / 2, pose);
   return [[rectN[0], rectN[1]], [rectN[2], rectN[1]], [rectN[2], rectN[3]], [rectN[0], rectN[3]]].map(([u, v]) => {
-    const r = rayDir(u * W, v * Hh, pose);
-    const k = d / (r.x * fwd.x + r.y * fwd.y + r.z * fwd.z);   // all corners on one plane facing the camera
+    const r = rayDir(u * W, v * Hh, pose), k = d / (r.x * fwd.x + r.y * fwd.y + r.z * fwd.z);
     return { x: c.x + r.x * k, y: c.y + r.y * k, z: c.z + r.z * k };
   });
 }
-/* Point the camera at an exact rotation. Camera.setRotation is sometimes ignored by the SDK, so
-   fall back to Camera.rotate (yaw changes by -h, pitch by +v) and verify we got there. */
+const snapPose = (p = poseCache) => ({ sweep: p.sweep, position: { ...p.position }, rotation: { ...p.rotation },
+  projection: p.projection ? Array.from(p.projection) : null, W: iframe.clientWidth, H: iframe.clientHeight });
+async function hitAt(x, y) {
+  try { const d = await sdk.Renderer.getWorldPositionData({ x, y }); return d && d.position ? d.position : null; } catch { return null; }
+}
+// Camera.setRotation is sometimes ignored by the SDK; rotate (yaw -h, pitch +v) and verify.
 async function lookAt(rot) {
   const off = () => { const c = poseCache.rotation; return { dy: ((rot.y - c.y + 540) % 360) - 180, dx: rot.x - c.x }; };
   for (let k = 0; k < 4; k++) {
-    let { dy, dx } = off();
+    const { dy, dx } = off();
     if (Math.abs(dy) < 0.6 && Math.abs(dx) < 0.6) return true;
     await soon(sdk.Camera.rotate(-dy, dx, { speed: 10000 }), 2500); await sleep(250);
   }
   const { dy, dx } = off(); return Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5;
 }
-async function hitAt(x, y) {
-  try { const d = await sdk.Renderer.getWorldPositionData({ x, y }); return d && d.position ? d.position : null; } catch { return null; }
-}
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.max(0, Math.round(p * (s.length - 1))))]; };
-
-/* Measure what is inside a screen rectangle: raycast a grid, fit a box aligned to the house axes. */
-async function worldFromRect(r) {
+async function worldFromRect(r) {       // fit a house-aligned 3D box to what's inside a screen rectangle
   const cam = poseCache.position;
   const center = await hitAt(r.x + r.w / 2, r.y + r.h / 2);
   if (!center) return null;
@@ -151,19 +126,14 @@ async function worldFromRect(r) {
   const floorY = Math.abs(yMin - camFloor) < 0.35 ? yMin : Math.min(yMin, camFloor);
   const w = Math.max(0.2, x1 - x0), d = Math.max(0.2, z1 - z0), h = Math.max(0.2, pct(ys, 0.92) - floorY);
   const lx = (x0 + x1) / 2, lz = (z0 + z1) / 2;
-  const box = { x: center.x + lx * c + lz * s, y: floorY + h / 2, z: center.z - lx * s + lz * c };
-  return { center: box, w, h, d, yaw, floorY, rise: Math.max(...ys) - Math.min(...ys) };
+  return { center: { x: center.x + lx * c + lz * s, y: floorY + h / 2, z: center.z - lx * s + lz * c }, w, h, d, yaw, floorY, rise: Math.max(...ys) - Math.min(...ys) };
 }
-
-// Screen rectangle of a world box from a pose (null if not usefully visible).
 function projectBox(world, pose = poseCache) {
-  const W = iframe.clientWidth, Hh = iframe.clientHeight;
-  const c = Math.cos(world.yaw), s = Math.sin(world.yaw), xs = [], ys = [];
+  const W = iframe.clientWidth, Hh = iframe.clientHeight, c = Math.cos(world.yaw), s = Math.sin(world.yaw), xs = [], ys = [];
   for (const dx of [-1, 1]) for (const dy of [-1, 1]) for (const dz of [-1, 1]) {
     const lx = dx * world.w / 2, lz = dz * world.d / 2;
-    const p = { x: world.center.x + lx * c + lz * s, y: world.center.y + dy * world.h / 2, z: world.center.z - lx * s + lz * c };
-    const q = sdk.Conversion.worldToScreen(p, pose, { w: W, h: Hh });
-    if (!q || q.z > 1 || q.z < -1) return null;          // behind the camera
+    const q = sdk.Conversion.worldToScreen({ x: world.center.x + lx * c + lz * s, y: world.center.y + dy * world.h / 2, z: world.center.z - lx * s + lz * c }, pose, { w: W, h: Hh });
+    if (!q || q.z > 1 || q.z < -1) return null;
     xs.push(q.x); ys.push(q.y);
   }
   const full = (Math.max(...xs) - Math.min(...xs)) * (Math.max(...ys) - Math.min(...ys));
@@ -172,21 +142,18 @@ function projectBox(world, pose = poseCache) {
   return r;
 }
 
-/* ---------------- rooms ---------------- */
+/* ================= rooms ================= */
 let sweepList = [], roomList = [], roomIdx = 0;
 async function collect(obs) {
-  const out = [];
-  // the first update can arrive empty while the model is still loading; wait for real data
-  let sub;
-  await Promise.race([new Promise((r) => { sub = obs.subscribe({ onCollectionUpdated: (c) => {
-    const v = Object.values(c); if (v.length) { out.splice(0, out.length, ...v); r(); } } }); }), sleep(10000)]);
+  const out = []; let sub;
+  await Promise.race([new Promise((r) => { sub = obs.subscribe({ onCollectionUpdated: (c) => { const v = Object.values(c); if (v.length) { out.splice(0, out.length, ...v); r(); } } }); }), sleep(10000)]);
   setTimeout(() => sub?.cancel?.());
   return out;
 }
 async function loadRooms() {
   sweepList = await collect(sdk.Sweep.data);
   let rooms = await collect(sdk.Room.data).catch(() => []);
-  if (!rooms.filter((r) => r.label).length) {         // SDK room feed is sometimes empty: use the Matterport API rooms (same ids)
+  if (!rooms.filter((r) => r.label).length) {
     for (let i = 0; i < 100 && !info; i++) await sleep(100);
     rooms = (info?.scan?.rooms || []).map((r) => ({ id: r.id, label: r.type }));
   }
@@ -206,18 +173,18 @@ async function goRoom(i) {
   if (!roomList.length) return;
   roomIdx = (i + roomList.length) % roomList.length;
   $('#room-name').textContent = roomList[roomIdx].label;
-  await sdk.Sweep.moveTo(centerSweep(roomList[roomIdx]).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }).catch(() => {});
+  await soon(sdk.Sweep.moveTo(centerSweep(roomList[roomIdx]).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }));
 }
 $('#room-prev').onclick = () => { stopAgent(); goRoom(roomIdx - 1); };
 $('#room-next').onclick = () => { stopAgent(); goRoom(roomIdx + 1); };
 $('#room-name').onclick = () => {
   const m = $('#room-menu');
-  m.innerHTML = roomList.map((r, i) => `<button data-i="${i}" class="block w-full text-left px-3 py-1.5 rounded-lg hover:bg-white/15">${r.label}</button>`).join('');
-  m.querySelectorAll('[data-i]').forEach((b) => b.onclick = () => { m.classList.add('hidden'); goRoom(+b.dataset.i); });
+  m.innerHTML = roomList.map((r, i) => `<button data-i="${i}" class="block w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-100">${esc(r.label)}</button>`).join('');
+  m.querySelectorAll('[data-i]').forEach((b) => b.onclick = () => { m.classList.add('hidden'); stopAgent(); goRoom(+b.dataset.i); });
   m.classList.toggle('hidden');
 };
 
-/* ---------------- pose: show this scan point's patches, render views that are missing ---------------- */
+/* ================= pose: show patches for this spot, re-render where useful ================= */
 let settleTimer = null;
 function onPose(p) {
   poseCache = p;
@@ -227,161 +194,206 @@ function onPose(p) {
     $('#room-name').textContent = r ? r.label : 'Between rooms';
     refreshVisibility();
   }
-  overlay.querySelectorAll('.sel-box').forEach((e) => e.remove());
+  overlay.querySelectorAll('.sel-box').forEach((e) => e.remove());   // 2D outlines only make sense for the view they were drawn in
+  if (mode === 'select') hideMenu();
   clearTimeout(settleTimer);
   settleTimer = setTimeout(renderMissingViews, 1100);
 }
 function refreshVisibility() {
-  for (const e of edits) {
-    const L = live[e.id]; if (!L) continue;
-    if (L.box) { comp(L.box).inputs.visible = e.on !== false && (view === 'plan' || (e.status && e.status !== 'done' && e.status !== 'failed')); comp(L.box).onInputsUpdated(); }
-    for (const [sw, n] of Object.entries(L.patches)) {
-      comp(n).inputs.visible = view === 'after' && sw === lastSweep && e.on !== false;
-      comp(n).onInputsUpdated();
-    }
+  for (const e of edits) for (const [sw, n] of Object.entries(live[e.id]?.patches || {})) {
+    comp(n).inputs.visible = view === 'after' && sw === lastSweep && e.on !== false && e.status === 'ready';
+    comp(n).onInputsUpdated();
   }
 }
-// Re-render a change from a new scan point only when it is clearly in view: same room (or very
-// close), large enough on screen, and not hidden behind a wall. Far, tiny or occluded views
-// produce floating, wrong-looking patches, so those are skipped.
 async function renderMissingViews() {
   if (!sdk || agentBusy || view !== 'after' || !poseCache) return;
   const pose = poseCache, W = iframe.clientWidth, Hh = iframe.clientHeight;
   for (const e of edits) {
-    if (e.on === false || !e.world || (e.status && e.status !== 'done') || e.patches.some((p) => p.sweep === pose.sweep)) continue;
-    const key = `${e.id}@${pose.sweep}`;
-    const d = dist(pose.position, e.world.center);
+    if (e.on === false || !e.world || e.status !== 'ready' || e.patches.some((p) => p.sweep === pose.sweep)) continue;
+    const key = `${e.id}@${pose.sweep}`, d = dist(pose.position, e.world.center);
     const sameRoom = e.roomId && currentRoom()?.id === e.roomId;
     if (pending.has(key) || d > 4.5 || (!sameRoom && d > 2.5)) continue;
     const r = projectBox(e.world, pose);
     if (!r || (r.x1 - r.x0) < 160 || (r.y1 - r.y0) < 140 || (r.x1 - r.x0) * (r.y1 - r.y0) < 0.06 * W * Hh) continue;
-    let clear = 0;                                                          // a wall in between?
+    let clear = 0;
     for (const [u, v] of [[0.5, 0.5], [0.3, 0.35], [0.7, 0.35], [0.3, 0.7], [0.7, 0.7]]) {
       const hit = await hitAt(r.x0 + (r.x1 - r.x0) * u, r.y0 + (r.y1 - r.y0) * v);
       if (hit && dist(pose.position, hit) > d - Math.max(e.world.w, e.world.d) * 0.75) clear++;
     }
     if (clear < 4 || pose.sweep !== poseCache.sweep) continue;
     pending.add(key);
-    status(`Rendering “${e.title}” from this spot…`);
-    try { await renderPatch(e, r, pose); } catch (err) { console.warn(err); }
-    pending.delete(key); status('');
+    const card = jobCard({ id: key, title: `Showing “${e.title}” from here`, step: 'Rendering this angle', pct: 60, busy: true });
+    try { await renderPatch(e, r, snapPose(pose), null, null); e.patches.at(-1).extra = true; save(); }
+    catch (err) { console.warn(err); }
+    pending.delete(key); card.remove(); refreshVisibility();
   }
 }
 
-/* ---------------- photoreal render ----------------
- * A selection captures the exact frame and camera pose the moment you make it. Renders use that
- * captured frame, never "whatever is on screen now", so you can keep walking while they run in the
- * background, and a change can never land on the wrong view. */
+/* ================= rendering ================= */
 async function grabFrame() {
   const W = iframe.clientWidth, Hh = iframe.clientHeight, k = Math.min(2, 1600 / W);
   return sdk.Renderer.takeScreenShot({ width: Math.round(W * k), height: Math.round(Hh * k) }, { mattertags: false, sweeps: false });
 }
-const snapPose = (p = poseCache) => ({ sweep: p.sweep, position: { ...p.position }, rotation: { ...p.rotation },
-  projection: p.projection ? Array.from(p.projection) : null, W: iframe.clientWidth, H: iframe.clientHeight });
 function taskText(e) {
   const what = e.custom || (e.option ? `${e.option.name} (${e.option.spec})` : e.title);
   if (e.action === 'remove') return `Remove ${e.item || 'the selected item'} completely and fill the space with the surrounding floor and wall. ${e.custom || ''}`;
-  if (e.action === 'add') return `Install ${what} here. Purpose: ${e.title}.`;
+  if (e.action === 'add') return `Install ${what}. Purpose: ${e.title}.`;
   return `Replace ${e.item || 'what is in the masked area'} with ${what}. Purpose: ${e.title}.`;
 }
-// r: {x0,y0,x1,y1} in css px of the view `pose` was taken at; poly: optional lasso points (css px)
-async function renderPatch(e, r, pose, image, poly) {
-  pose = pose || snapPose();
-  const W = pose.W || iframe.clientWidth, Hh = pose.H || iframe.clientHeight;
+async function renderPatch(e, r, pose, image, poly, fix) {
   image = image || await grabFrame();
+  const W = pose.W, Hh = pose.H;
   const meta = await fetch(`/api/home/${H.id}/render`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image, rect: [r.x0 / W, r.y0 / Hh, r.x1 / W, r.y1 / Hh], task: taskText(e), ref: e.ref || null,
+    body: JSON.stringify({ image, rect: [r.x0 / W, r.y0 / Hh, r.x1 / W, r.y1 / Hh], task: taskText(e), ref: e.ref || null, fix: fix || null,
       poly: poly ? poly.map(([x, y]) => [x / W, y / Hh]) : null }) }).then((x) => x.json());
   if (meta.error) throw new Error(meta.error);
-  if (!e.ref) e.ref = meta.id;
   const p = { sweep: pose.sweep, rid: meta.id, corners: patchCorners(meta.rect, pose), rot: { ...pose.rotation } };
-  e.patches.push(p); e.thumb = meta.id; save();
+  e.patches.push(p); save();
   await mountPatch(e, p);
-  refreshVisibility();
   return meta;
 }
 async function mountPatch(e, p) {
   const n = await addNode('fd.photo', { url: `/api/home/${H.id}/render/${p.rid}/patch`, corners: p.corners, visible: false });
   (live[e.id] ||= { patches: {} }).patches[p.sweep] = n;
 }
-const BOX_COLOR = { pending: 0x7c5cff, add: 0x22c55e, remove: 0xef4444, replace: 0xf59e0b };
-async function mountBox(e) {
-  const w = e.world; if (!w) return;
-  const n = await addNode('fd.planbox', { w: w.w, h: w.h, d: w.d, color: BOX_COLOR[e.status === 'done' ? e.action : 'pending'] || BOX_COLOR.replace, visible: true }, (n) => {
-    n.position.set(w.center.x, w.center.y, w.center.z);
-    n.quaternion.setFromAxisAngle({ x: 0, y: 1, z: 0 }, w.yaw);
-  });
-  (live[e.id] ||= { patches: {} }).box = n;
-}
-function boxColor(e) {
-  const n = live[e.id]?.box; if (!n) return;
-  const c = comp(n); c.inputs.color = e.status === 'done' ? (BOX_COLOR[e.action] || BOX_COLOR.replace) : BOX_COLOR.pending; c.onInputsUpdated();
+function dropPatch(e, p) {
+  const n = live[e.id]?.patches?.[p.sweep]; if (n) { n.stop(); delete live[e.id].patches[p.sweep]; }
+  e.patches = e.patches.filter((x) => x !== p);
 }
 
-/* ---------------- jobs: several changes can be in flight while you keep touring ---------------- */
-let jobsRunning = 0;
-const selFor = new Map();   // editId -> selection (keeps the captured frame in memory for re-renders)
-const applying = false;    // kept for the issue reporter's context
-function jobStatus() {
-  const n = edits.filter((e) => e.status === 'analyzing' || e.status === 'rendering').length;
-  status(n ? `${n} change${n > 1 ? 's' : ''} in progress. Keep exploring, they'll appear when ready.` : '');
+/* ================= processing window ================= */
+const STEPS = { understanding: ['Understanding your request', 15], designing: ['Choosing the product & price', 35], rendering: ['Rendering it into your home', 60],
+  checking: ['Checking the result looks right', 88], fixing: ['Fixing what the check found', 70], ready: ['Ready', 100], failed: ['Could not finish', 100] };
+function jobCard({ id, title, step, pct, busy, thumb }) {
+  let el = document.getElementById('job-' + id);
+  if (!el) { el = document.createElement('div'); el.id = 'job-' + id; el.className = 'job'; $('#jobs').prepend(el); }
+  el.innerHTML = `<div class="flex items-start gap-2">${thumb ? `<img src="${thumb}" class="w-10 h-10 rounded-md object-cover shrink-0">` : ''}
+    <div class="min-w-0 flex-1"><div class="text-sm font-semibold leading-tight truncate">${esc(title)}</div>
+    <div class="text-xs text-slate-500 mt-0.5">${esc(step)}</div></div></div>
+    <div class="job-bar mt-2 ${busy ? 'busy' : ''}"><div style="width:${pct}%"></div></div>`;
+  return el;
 }
-function newEdit(sel, fields) {
-  const e = { id: 'e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), title: 'Working on it…', action: 'replace',
-    item: sel.item || '', option: null, custom: '', options: [], world: sel.world, cost: 0, patches: [], agent: false, on: true,
-    room: sel.roomLabel || '', roomId: sel.roomId || null, status: 'analyzing', crop: sel.crop, ...fields };
-  selFor.set(e.id, sel);
-  edits.push(e); save(); renderPlan(); jobStatus();
-  if (sel.marker) { (live[e.id] ||= { patches: {} }).box = sel.marker; sel.marker = null; } else mountBox(e);
-  return e;
-}
-// Render an edit from the selection's captured frame (no camera movement needed).
-async function runRender(e, sel) {
-  e.status = 'rendering'; boxColor(e); save(); renderPlan(); jobStatus();
-  jobsRunning++;
-  try {
-    const r = { x0: sel.rect.x, y0: sel.rect.y, x1: sel.rect.x + sel.rect.w, y1: sel.rect.y + sel.rect.h };
-    const meta = await renderPatch(e, r, sel.pose, sel.frame, sel.poly);
-    e.status = 'done'; boxColor(e); save(); refreshVisibility();
-    return meta;
-  } catch (err) {
-    e.status = 'failed'; e.error = err.message; save();
-    return null;
-  } finally { jobsRunning--; renderPlan(); jobStatus(); }
-}
-// Used by option cards and the agent: create + render in one go.
-async function applyChange(sel, change, option, custom, agent = false) {
-  const e = newEdit(sel, { title: change.title, action: change.action, item: sel.item || change.item || '', option: option || null,
-    custom: custom || '', options: change.options || [], cost: option ? option.total : 0, agent, status: 'rendering' });
-  const meta = await runRender(e, sel);
-  sel.box?.remove();
-  return { e, meta };
-}
-// A direct command on a selection ("remove it", "replace with ..."): analyze, pick the standard option, render. No extra clicks.
-async function command(sel, instruction, label) {
-  hideMenu();
-  sel.box?.remove(); selections = selections.filter((x) => x !== sel); renderSelChips();   // it's a change now, tracked in Changes
-  const e = newEdit(sel, { title: label || instruction });
-  bubble(`<div class="flex gap-3 items-center"><img src="${sel.crop}" class="w-10 h-10 rounded-lg object-cover shrink-0">
-    <div class="text-sm"><b>${label || instruction}</b><div class="text-slate-500">Working on it in the background. Keep exploring; it shows up in <b>Changes</b> and in the tour when ready.</div></div></div>`);
-  try {
-    const res = await fetch(`/api/home/${H.id}/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ crop: sel.crop, full: sel.full, instruction, room: sel.roomLabel, needs: NEEDS,
-        size: sel.world && { w: sel.world.w, h: sel.world.h, d: sel.world.d, rise: sel.world.rise } }) }).then((r) => r.json());
-    if (res.error) throw new Error(res.error);
-    const c = (res.changes || [])[0];
-    if (!c) throw new Error('no change proposed');
-    const opt = (c.options || [])[Math.min(1, (c.options || []).length - 1)] || null;
-    Object.assign(e, { title: c.title, action: c.action, item: res.items?.[0]?.name || sel.item || '', options: c.options || [], option: opt,
-      cost: opt?.total || 0, custom: /replace|add|install|put/i.test(instruction) ? instruction : '' });
-    sel.item = e.item;
-    await runRender(e, sel);
-  } catch (err) {
-    e.status = 'failed'; e.error = err.message; save(); renderPlan(); jobStatus();
+function showJob(e) {
+  const [step, pct] = STEPS[e.status] || ['', 0];
+  const el = jobCard({ id: e.id, title: e.title, step: e.status === 'checking' && e.tries ? `${step} (attempt ${e.tries + 1})` : step, pct,
+    busy: ['rendering', 'fixing', 'checking', 'understanding'].includes(e.status), thumb: e.crop });
+  if (e.status === 'ready') {
+    el.innerHTML = `<div class="flex items-center gap-2"><img src="/api/home/${H.id}/render/${e.patches[0]?.rid}/after" class="w-14 h-11 rounded-md object-cover shrink-0">
+      <div class="min-w-0 flex-1"><div class="text-[11px] font-bold text-emerald-700">READY${e.score ? ` · quality ${e.score}/10` : ''}</div>
+      <div class="text-sm font-semibold leading-tight truncate">${esc(e.title)}</div></div></div>
+      <div class="mt-2 flex gap-2"><button data-show class="flex-1 text-sm font-semibold bg-brand-600 text-white rounded-lg py-1.5 hover:bg-brand-700">Show me</button>
+      <button data-dismiss class="text-sm text-slate-500 px-2 rounded-lg hover:bg-slate-100">Later</button></div>`;
+    el.querySelector('[data-show]').onclick = () => { el.remove(); flyTo(e); };
+    el.querySelector('[data-dismiss]').onclick = () => el.remove();
+  } else if (e.status === 'failed') {
+    el.innerHTML = `<div class="text-sm font-semibold text-red-700">${esc(e.title)}</div><div class="text-xs text-slate-500">${esc(e.error || 'Something went wrong')}</div>
+      <div class="mt-1.5 flex gap-2"><button data-retry class="text-xs font-semibold border rounded-lg px-2 py-1">Try again</button><button data-dismiss class="text-xs text-slate-500 px-2">Dismiss</button></div>`;
+    el.querySelector('[data-retry]').onclick = () => { el.remove(); const s = selFor.get(e.id); removeEdit(e.id, true); if (s) command(s, e.instruction || e.title, e.title); };
+    el.querySelector('[data-dismiss]').onclick = () => { el.remove(); removeEdit(e.id, true); };
   }
 }
 
-/* ---------------- selection: box or lasso, kept pinned in 3D, with an action menu ---------------- */
+/* ================= changes: locate -> price -> render -> review -> ready ================= */
+function annotate(sel) {      // frozen frame with the user's loose outline drawn on it, for the agent
+  return new Promise((res) => {
+    const img = new Image(); img.onload = () => {
+      const c = document.createElement('canvas'), k = Math.min(1, 1100 / img.naturalWidth);
+      c.width = img.naturalWidth * k; c.height = img.naturalHeight * k;
+      const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, c.width, c.height);
+      if (!sel.whole) {
+        const sx = c.width / sel.pose.W, sy = c.height / sel.pose.H;
+        ctx.strokeStyle = '#ff00ff'; ctx.lineWidth = 4; ctx.setLineDash([12, 8]); ctx.beginPath();
+        if (sel.poly) sel.poly.forEach(([x, y], i) => i ? ctx.lineTo(x * sx, y * sy) : ctx.moveTo(x * sx, y * sy));
+        else ctx.rect(sel.rect.x * sx, sel.rect.y * sy, sel.rect.w * sx, sel.rect.h * sy);
+        ctx.closePath(); ctx.stroke();
+      }
+      res(c.toDataURL('image/jpeg', 0.88));
+    };
+    img.src = sel.frame;
+  });
+}
+const STOP = new Set(['the', 'a', 'an', 'this', 'that', 'it', 'with', 'and', 'to', 'make', 'into', 'add', 'replace', 'remove', 'here', 'of', 'for', 'in', 'on', 'please', 'accessible', 'needs']);
+const words = (t) => new Set(String(t).toLowerCase().match(/[a-z]+/g)?.filter((w) => w.length > 2 && !STOP.has(w)) || []);
+function similarEdit(sel, instruction) {
+  const want = words(instruction);
+  return edits.find((e) => e.status !== 'failed' && e.on !== false && e.roomId && e.roomId === sel.roomId &&
+    ((e.world && sel.world && !sel.whole && dist(e.world.center, sel.world.center) < 1.2) || [...words(e.title + ' ' + (e.instruction || ''))].filter((w) => want.has(w)).length >= 2));
+}
+function ask(html, buttons) {   // a question in the chat with button answers
+  return new Promise((res) => {
+    const el = bubble(`${html}<div class="mt-2 flex flex-wrap gap-2">${buttons.map(([k, l], i) => `<button data-k="${k}" class="text-sm font-semibold rounded-lg px-3 py-1.5 ${i ? 'border hover:bg-slate-50' : 'bg-brand-600 text-white hover:bg-brand-700'}">${l}</button>`).join('')}</div>`);
+    el.querySelectorAll('[data-k]').forEach((b) => b.onclick = () => { el.querySelectorAll('button').forEach((x) => x.disabled = true); b.classList.add('ring-2', 'ring-brand-300'); res(b.dataset.k); });
+  });
+}
+function newEdit(sel, fields) {
+  const e = { id: 'e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), title: 'Working on it', action: 'replace', item: sel.item || '',
+    option: null, options: [], custom: '', world: sel.world, cost: 0, patches: [], on: true, room: sel.roomLabel || '', roomId: sel.roomId || null,
+    status: 'understanding', crop: sel.crop, tries: 0, ...fields };
+  selFor.set(e.id, sel); edits.push(e); save(); renderPlan(); showJob(e);
+  return e;
+}
+function setStatus(e, s, extra = {}) { Object.assign(e, extra, { status: s }); save(); renderPlan(); showJob(e); }
+
+// Run a change. `finding` (from the guided tour) skips the locate step.
+async function command(sel, instruction, label, finding = null) {
+  hideMenu(); clearOutline(sel);
+  selections = selections.filter((x) => x !== sel); renderSelChips();
+  const dup = similarEdit(sel, instruction);
+  if (dup) {
+    const k = await ask(`You already have <b>${esc(dup.title)}</b> here${dup.option ? ` (${esc(dup.option.name)}, ${money(dup.cost)})` : ''}. What would you like?`,
+      [['replace', 'Replace it with this'], ['keep', 'Keep what I have'], ['both', 'Add both']]);
+    if (k === 'keep') { flyTo(dup); return; }
+    if (k === 'replace') removeEdit(dup.id, true);
+  }
+  const e = newEdit(sel, { title: label || instruction, instruction });
+  try {
+    let f = finding;
+    if (!f) {
+      const image = await annotate(sel);
+      const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ views: [{ image, room: sel.roomLabel }], needs: NEEDS, persona: PERSONA, instruction, outlined: !sel.whole,
+          existing: edits.filter((x) => x !== e && x.status !== 'failed').map((x) => `${x.room}: ${x.title}`) }) }).then((r) => r.json());
+      if (plan.error) throw new Error(plan.error);
+      f = (plan.findings || [])[0];
+      if (!f) throw new Error("I couldn't find what you meant in that view. Try circling it again.");
+    }
+    // the agent's box around the whole object becomes the edit area
+    if (f.box_2d) {
+      const b = f.box_2d, W = sel.pose.W, Hh = sel.pose.H, m = 0.04;
+      const x0 = Math.max(0, (b[1] / 1000 - m) * W), y0 = Math.max(0, (b[0] / 1000 - m) * Hh), x1 = Math.min(W, (b[3] / 1000 + m) * W), y1 = Math.min(Hh, (b[2] / 1000 + m) * Hh);
+      if (x1 - x0 > 30 && y1 - y0 > 30) { sel.rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }; sel.poly = null; }
+    }
+    const opts = f.options || [], opt = opts[Math.min(1, opts.length - 1)] || null;
+    setStatus(e, 'designing', { title: f.title || e.title, action: f.action || 'replace', item: f.item || '', options: opts, option: opt, cost: opt?.total || 0,
+      custom: !finding && !/accessible for my needs/.test(instruction) && /replace|add|install|put|make|turn|convert/i.test(instruction) ? instruction : '' });
+    if (f.advice) bubble(`<div class="text-sm"><b>${esc(e.title)}</b>${opt ? ` · ${esc(opt.name)} · ${money(opt.total)}` : ''}<div class="text-slate-600 mt-0.5">${f.fits_needs === false ? '⚠️ ' : ''}${esc(f.advice)}</div></div>`);
+    await renderAndReview(e, sel);
+  } catch (err) {
+    setStatus(e, 'failed', { error: err.message });
+  }
+}
+async function renderAndReview(e, sel) {
+  const r = { x0: sel.rect.x, y0: sel.rect.y, x1: sel.rect.x + sel.rect.w, y1: sel.rect.y + sel.rect.h };
+  let fix = null;
+  for (e.tries = 0; e.tries < 3; e.tries++) {
+    setStatus(e, e.tries ? 'fixing' : 'rendering');
+    for (const p of [...e.patches]) dropPatch(e, p);
+    const meta = await renderPatch(e, r, sel.pose, sel.frame, sel.poly, fix);
+    if (!e.ref) e.ref = meta.id;
+    setStatus(e, 'checking');
+    const q = await fetch(`/api/home/${H.id}/verify`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rid: meta.id, task: taskText(e) }) }).then((x) => x.json()).catch(() => ({ ok: true }));
+    e.score = q.score; e.review = q;
+    if (q.ok !== false) break;
+    fix = [q.fix, ...(q.issues || [])].filter(Boolean).join('; ');
+    e.ref = null;
+  }
+  setStatus(e, 'ready');
+  refreshVisibility();
+  if (e.review && e.review.ok === false) bubble(`<div class="text-sm">I rendered <b>${esc(e.title)}</b>, but the quality check still flagged: ${esc((e.review.issues || []).join('; '))}. Swap the product in <b>Changes</b> to try another look.</div>`);
+}
+
+/* ================= selection: draw / box, frozen view, action menu ================= */
 const overlay = $('#overlay');
 let drag = null, tool = 'lasso';
 function setMode(m) {
@@ -391,22 +403,27 @@ function setMode(m) {
   $('#mode-select').className = 'px-4 py-2 rounded-full ' + (m === 'select' ? 'bg-brand-600 text-white' : '');
   $('#mode-walk').className = 'px-4 py-2 rounded-full ' + (m === 'walk' ? 'bg-ink text-white' : '');
   $('#tool-pick').classList.toggle('hidden', m !== 'select');
-  if (m === 'select') { stopAgent(); hint(tool === 'lasso' ? 'Draw around what you want to change. <b>Shift</b> adds more.' : 'Drag a box around what you want to change. <b>Shift</b> adds more.', 5000); }
+  if (m === 'select') { stopAgent(); hint('Circle what you want to change, loosely is fine. Then pick what to do.', 6000); }
   else hideMenu();
 }
 function setTool(t) {
   tool = t;
-  for (const b of document.querySelectorAll('[data-tool-pick]')) b.className = 'px-3 py-1.5 rounded-full ' + (b.dataset.toolPick === t ? 'bg-white text-ink' : 'text-white');
+  document.querySelectorAll('[data-tool-pick]').forEach((b) => b.className = 'px-3 py-1.5 rounded-full ' + (b.dataset.toolPick === t ? 'bg-ink text-white' : ''));
 }
 document.querySelectorAll('[data-tool-pick]').forEach((b) => b.onclick = () => setTool(b.dataset.toolPick));
 $('#mode-walk').onclick = () => setMode('walk');
 $('#mode-select').onclick = () => setMode('select');
+$('#qa-change').onclick = () => setMode('select');
+let peek = false;
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
   if (e.key === 's' || e.key === 'S') setMode('select');
   if (e.key === 'w' || e.key === 'W') setMode('walk');
-  if (e.key === 'Escape') clearSelections();
+  if ((e.key === 'b' || e.key === 'B') && !e.repeat && view === 'after') { peek = true; setView('orig'); }
+  if (e.key === 'Escape') { clearSelections(); closeDrawers(); }
 });
+document.addEventListener('keyup', (e) => { if ((e.key === 'b' || e.key === 'B') && peek) { peek = false; setView('after'); } });
 const svgNS = 'http://www.w3.org/2000/svg';
 overlay.addEventListener('pointerdown', (e) => {
   if (mode !== 'select' || !sdk || e.target.closest('#sel-menu')) return;
@@ -417,7 +434,7 @@ overlay.addEventListener('pointerdown', (e) => {
   else {
     drag.el = document.createElementNS(svgNS, 'svg'); drag.el.setAttribute('class', 'absolute inset-0 w-full h-full pointer-events-none');
     drag.path = document.createElementNS(svgNS, 'path');
-    drag.path.setAttribute('fill', 'rgba(124,92,255,.18)'); drag.path.setAttribute('stroke', '#7c5cff'); drag.path.setAttribute('stroke-width', '2.5');
+    drag.path.setAttribute('fill', 'rgba(124,92,255,.15)'); drag.path.setAttribute('stroke', '#7c5cff'); drag.path.setAttribute('stroke-width', '3');
     drag.el.appendChild(drag.path); overlay.appendChild(drag.el);
   }
   overlay.setPointerCapture(e.pointerId);
@@ -438,93 +455,79 @@ overlay.addEventListener('pointerup', async () => {
     const xs = poly.map((p) => p[0]), ys = poly.map((p) => p[1]);
     r = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
   } else r = { x: Math.min(d.x0, d.x1 ?? d.x0), y: Math.min(d.y0, d.y1 ?? d.y0), w: Math.abs((d.x1 ?? d.x0) - d.x0), h: Math.abs((d.y1 ?? d.y0) - d.y0) };
-  if (r.w < 14 || r.h < 14) { r = { x: d.x0 - 70, y: d.y0 - 70, w: 140, h: 140 }; poly = null; }
-  if (!d.add) clearSelections(true);
+  if (r.w < 14 || r.h < 14) { r = { x: d.x0 - 80, y: d.y0 - 80, w: 160, h: 160 }; poly = null; }
+  if (!d.add) clearSelections();
   await makeSelection(r, poly);
 });
-function cropOf(img, r, max = 640) {
-  const k = img.naturalWidth / iframe.clientWidth, c = document.createElement('canvas');
+function cropOf(img, r, W, max = 640) {
+  const k = img.naturalWidth / W, c = document.createElement('canvas');
   const s = Math.min(1, max / (Math.max(r.w, r.h) * k));
   c.width = Math.max(1, r.w * k * s); c.height = Math.max(1, r.h * k * s);
   c.getContext('2d').drawImage(img, r.x * k, r.y * k, r.w * k, r.h * k, 0, 0, c.width, c.height);
   return c.toDataURL('image/jpeg', 0.88);
 }
-// Freeze everything a later render needs: frame, pose, 3D box, crop. Then pin a highlight in 3D and open the menu.
 async function makeSelection(r, poly = null, opts = {}) {
   const pose = snapPose();
-  const outline = screenOutline(r, poly, opts.label || 'Selected');
+  const outline = opts.silent ? null : screenOutline(r, poly);
   const [frame, world] = await Promise.all([grabFrame(), worldFromRect(r)]);
   const img = new Image(); img.src = frame; await img.decode();
-  const sel = { id: 's' + Date.now(), rect: r, poly, frame, pose, world, box: outline, crop: cropOf(img, r),
-    full: cropOf(img, { x: 0, y: 0, w: pose.W, h: pose.H }, 1000), item: opts.item || '', label: opts.label || 'Selection',
-    roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null };
-  if (world) sel.marker = await addNode('fd.planbox', { w: world.w, h: world.h, d: world.d, color: BOX_COLOR.pending, visible: true }, (n) => {
-    n.position.set(world.center.x, world.center.y, world.center.z); n.quaternion.setFromAxisAngle({ x: 0, y: 1, z: 0 }, world.yaw);
-  });
-  selections.push(sel); renderSelChips();
-  if (!opts.silent) showMenu(sel);
+  const sel = { id: 's' + Date.now(), rect: r, poly, frame, pose, world, box: outline, crop: cropOf(img, r, pose.W), whole: !!opts.whole,
+    item: opts.item || '', label: opts.label || 'Your selection', roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null };
+  if (!opts.silent) { selections.push(sel); renderSelChips(); showMenu(sel); }
   return sel;
 }
-function screenOutline(r, poly, label) {
+function screenOutline(r, poly) {
   const el = document.createElement('div');
   el.className = 'sel-box pending';
   Object.assign(el.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
   if (poly) {
     el.style.border = 'none'; el.style.background = 'none';
-    el.innerHTML = `<svg class="absolute inset-0 overflow-visible" width="${r.w}" height="${r.h}"><path d="M${poly.map(([x, y]) => `${x - r.x},${y - r.y}`).join('L')}Z" fill="rgba(124,92,255,.16)" stroke="#7c5cff" stroke-width="2.5" stroke-dasharray="7 5"/></svg>`;
+    el.innerHTML = `<svg class="absolute inset-0 overflow-visible" width="${r.w}" height="${r.h}"><path d="M${poly.map(([x, y]) => `${x - r.x},${y - r.y}`).join('L')}Z" fill="rgba(124,92,255,.14)" stroke="#7c5cff" stroke-width="3" stroke-dasharray="8 6"/></svg>`;
   }
-  el.insertAdjacentHTML('beforeend', `<span class="sel-label">${label}</span>`);
   overlay.appendChild(el); return el;
 }
-function clearSelections(keepMarkers = false) {
-  for (const s of selections) { s.box?.remove(); if (!keepMarkers && s.marker) { s.marker.stop(); s.marker = null; } }
-  if (keepMarkers) for (const s of selections) if (s.marker) { s.marker.stop(); s.marker = null; }
-  selections = []; renderSelChips(); hideMenu();
-}
+function clearOutline(sel) { sel.box?.remove(); sel.box = null; }
+function clearSelections() { for (const s of selections) clearOutline(s); selections = []; renderSelChips(); hideMenu(); }
 function renderSelChips() {
   $('#sel-chips').innerHTML = selections.map((s) => `<span class="inline-flex items-center gap-1.5 text-xs font-medium bg-brand-50 text-brand-700 rounded-full pl-1 pr-1 py-1">
-    <img src="${s.crop}" class="w-6 h-6 rounded-full object-cover">${s.label}<button data-x="${s.id}" class="w-5 h-5 rounded-full hover:bg-brand-100" aria-label="Remove selection">✕</button></span>`).join('');
+    <img src="${s.crop}" class="w-6 h-6 rounded-full object-cover">${esc(s.label)}<button data-x="${s.id}" class="w-5 h-5 rounded-full hover:bg-brand-100" aria-label="Remove selection">✕</button></span>`).join('');
   $('#sel-chips').querySelectorAll('[data-x]').forEach((b) => b.onclick = () => {
-    const s = selections.find((x) => x.id === b.dataset.x); s?.box?.remove(); s?.marker?.stop();
+    const s = selections.find((x) => x.id === b.dataset.x); if (s) clearOutline(s);
     selections = selections.filter((x) => x.id !== b.dataset.x); renderSelChips(); hideMenu();
   });
 }
-
-/* the floating action menu next to a selection (tap-and-hold style) */
 function hideMenu() { $('#sel-menu')?.remove(); }
 function showMenu(sel) {
   hideMenu();
   const m = document.createElement('div');
   m.id = 'sel-menu';
   m.className = 'absolute z-40 w-64 bg-white/95 backdrop-blur rounded-2xl shadow-2xl ring-1 ring-black/5 overflow-hidden text-[15px] text-ink';
-  const left = Math.min(overlay.clientWidth - 270, Math.max(8, sel.rect.x + sel.rect.w + 10));
-  const top = Math.min(overlay.clientHeight - 300, Math.max(8, sel.rect.y));
-  Object.assign(m.style, { left: left + 'px', top: top + 'px' });
+  Object.assign(m.style, { left: Math.min(overlay.clientWidth - 270, Math.max(8, sel.rect.x + sel.rect.w + 10)) + 'px', top: Math.min(overlay.clientHeight - 320, Math.max(60, sel.rect.y)) + 'px' });
   const row = (k, label, icon) => `<button data-act="${k}" class="w-full flex items-center justify-between px-4 py-2.5 hover:bg-slate-100 border-t border-slate-100">${label}<span class="text-slate-400">${icon}</span></button>`;
-  m.innerHTML = `<div class="flex items-center gap-2 px-3 py-2 bg-slate-50"><img src="${sel.crop}" class="w-8 h-8 rounded-md object-cover"><span class="font-semibold text-sm truncate" data-label>${sel.label}</span>
-      <button data-act="close" class="ml-auto text-slate-400 hover:text-ink" aria-label="Close menu">✕</button></div>
-    ${row('remove', 'Remove it', '🗑')}${row('replace', 'Replace with…', '⇄')}${row('add', 'Add here…', '＋')}${row('suggest', 'What would help here?', '✦')}
+  m.innerHTML = `<div class="flex items-center gap-2 px-3 py-2 bg-slate-50"><img src="${sel.crop}" class="w-8 h-8 rounded-md object-cover"><span class="font-semibold text-sm">What should happen here?</span>
+      <button data-act="close" class="ml-auto text-slate-400 hover:text-ink" aria-label="Cancel selection">✕</button></div>
+    ${row('suggest', 'Make it accessible for me', '✦')}${row('remove', 'Remove it', '🗑')}${row('replace', 'Replace with…', '⇄')}${row('add', 'Add here…', '＋')}
     <form data-say class="hidden border-t border-slate-100 p-2 flex gap-1.5"><input class="flex-1 min-w-0 text-sm border rounded-lg px-2 py-1.5 outline-none focus:border-brand-500"><button class="text-sm font-semibold bg-brand-600 text-white rounded-lg px-3">Go</button></form>
-    <form data-free class="border-t border-slate-100 p-2 flex gap-1.5"><input class="flex-1 min-w-0 text-sm border rounded-lg px-2 py-1.5 outline-none focus:border-brand-500" placeholder="Or tell the agent…"><button class="text-sm font-semibold bg-ink text-white rounded-lg px-3">↵</button></form>`;
+    <form data-free class="border-t border-slate-100 p-2 flex gap-1.5"><input class="flex-1 min-w-0 text-sm border rounded-lg px-2 py-1.5 outline-none focus:border-brand-500" placeholder="Or describe it…"><button class="text-sm font-semibold bg-ink text-white rounded-lg px-3">↵</button></form>`;
   overlay.appendChild(m);
-  let pending = null;
+  let pendingAct = null;
   const say = m.querySelector('[data-say]'), sayIn = say.querySelector('input');
   m.querySelectorAll('[data-act]').forEach((b) => b.onclick = () => {
     const a = b.dataset.act;
-    if (a === 'close') return hideMenu();
-    if (a === 'remove') return command(sel, 'Remove this completely', `Remove ${sel.item || 'it'}`);
-    if (a === 'suggest') { hideMenu(); return analyze(sel); }
-    pending = a; say.classList.remove('hidden');
-    sayIn.placeholder = a === 'replace' ? 'e.g. a curbless walk-in shower with a seat' : 'e.g. grab bars, a ramp, a bench';
+    if (a === 'close') { clearOutline(sel); selections = selections.filter((x) => x !== sel); renderSelChips(); return hideMenu(); }
+    if (a === 'remove') return command(sel, 'Remove this completely', 'Remove it');
+    if (a === 'suggest') return command(sel, `Make this accessible for my needs (${NEEDS.join(', ') || 'mobility'})`, 'Make it accessible');
+    pendingAct = a; say.classList.remove('hidden');
+    sayIn.placeholder = a === 'replace' ? 'e.g. a curbless walk-in shower with a seat' : 'e.g. grab bars by the toilet';
     sayIn.focus();
   });
   say.onsubmit = (ev) => { ev.preventDefault(); const t = sayIn.value.trim(); if (!t) return;
-    command(sel, pending === 'replace' ? `Replace this with: ${t}` : `Add here: ${t}`, `${pending === 'replace' ? 'Replace with' : 'Add'} ${t}`); };
+    command(sel, pendingAct === 'replace' ? `Replace this with: ${t}` : `Add here: ${t}`, `${pendingAct === 'replace' ? 'Replace with' : 'Add'} ${t}`); };
   m.querySelector('[data-free]').onsubmit = (ev) => { ev.preventDefault(); const t = ev.currentTarget.querySelector('input').value.trim(); if (t) command(sel, t, t); };
-  // label the selection once the agent knows what it is (cheap: reuse the analyze endpoint lazily only on demand)
+  m.querySelector('[data-free] input').focus();
 }
 
-/* ---------------- chat + change cards with priced product options ---------------- */
+/* ================= chat ================= */
 function bubble(html, who = 'ai') {
   const el = document.createElement('div');
   el.className = who === 'user' ? 'flex justify-end' : 'flex';
@@ -533,205 +536,137 @@ function bubble(html, who = 'ai') {
   $('#chat').appendChild(el); $('#chat').scrollTop = 1e9; return el;
 }
 const thinking = (t = 'Thinking') => bubble(`<span class="dots text-slate-500">${t}<span>.</span><span>.</span><span>.</span></span>`);
-const compareHtml = (rid) => `<div class="mt-2 grid grid-cols-2 gap-1.5 text-[11px] text-slate-500">
-  <figure><img src="/api/home/${H.id}/render/${rid}/before" class="rounded-lg"><figcaption>Before</figcaption></figure>
-  <figure><img src="/api/home/${H.id}/render/${rid}/after" class="rounded-lg"><figcaption>After</figcaption></figure></div>`;
-
-function changeCard(sel, c) {
-  const id = 'c' + Math.random().toString(36).slice(2, 8), opts = c.options || [];
-  let pick = Math.min(1, Math.max(0, opts.length - 1));
-  const detail = (o) => o ? `<div class="font-medium text-slate-800">${o.name}</div>
-      <div class="text-xs text-slate-500">Item ${money(o.material)} · Labor ${money(o.labor)} (${o.labor_hours} h × ${money(o.labor_rate)}/h)</div>
-      ${o.notes ? `<div class="text-xs text-slate-400 mt-0.5">${o.notes}</div>` : ''}` : '';
-  setTimeout(() => {
-    const root = document.getElementById(id); if (!root) return;
-    root.querySelectorAll('[data-tier]').forEach((b) => b.onclick = () => {
-      pick = +b.dataset.tier;
-      root.querySelectorAll('[data-tier]').forEach((x) => x.className = tierCls(+x.dataset.tier === pick));
-      root.querySelector('[data-detail]').innerHTML = detail(opts[pick]);
-    });
-    root.querySelector('[data-own]').onclick = (ev) => { ev.currentTarget.remove(); root.querySelector('[data-custom]').classList.remove('hidden'); root.querySelector('[data-custom]').focus(); };
-    root.querySelector('[data-apply]').onclick = async (ev) => {
-      const b = ev.currentTarget; b.disabled = true; b.innerHTML = '<span class="dots">Rendering into the home<span>.</span><span>.</span><span>.</span></span>';
-      const { meta } = await applyChange(sel, c, opts[pick], root.querySelector('[data-custom]').value.trim());
-      b.textContent = meta ? '✓ In your plan, shown in the tour' : 'Try again'; b.disabled = !!meta;
-      if (meta) { b.className = 'mt-2 w-full text-sm font-semibold bg-emerald-50 text-emerald-700 rounded-lg px-3 py-2'; root.insertAdjacentHTML('beforeend', compareHtml(meta.id)); }
-    };
-  });
-  const tierCls = (on) => 'rounded-lg border px-2 py-1.5 text-left transition ' + (on ? 'border-brand-500 bg-brand-50 ring-1 ring-brand-500' : 'border-slate-200 hover:border-brand-300');
-  const tag = { remove: 'Remove', add: 'Add', replace: 'Replace' }[c.action] || c.action;
-  return `<div id="${id}" class="mt-3 border border-slate-200 bg-white rounded-xl p-3">
-    <div class="flex items-center gap-2"><span class="text-[10px] font-bold uppercase tracking-wide bg-slate-100 text-slate-600 rounded px-1.5 py-0.5">${tag}</span>
-      <span class="font-semibold leading-tight">${c.title || ''}</span></div>
-    ${c.reason ? `<div class="text-xs text-slate-500 mt-1 line-clamp-2">${c.reason}</div>` : ''}
-    ${opts.length ? `<div class="mt-2 grid grid-cols-${Math.min(3, opts.length)} gap-1.5">${opts.map((o, i) => `<button type="button" data-tier="${i}" class="${tierCls(i === pick)}">
-        <div class="text-[11px] text-slate-500">${o.tier}</div><div class="font-bold text-sm">${money(o.total)}</div></button>`).join('')}</div>
-      <div data-detail class="mt-2 text-sm">${detail(opts[pick])}</div>` : ''}
-    <button data-own class="mt-1 text-xs text-brand-700 hover:underline">Describe your own instead</button>
-    <input data-custom class="hidden mt-2 w-full text-sm border rounded-lg px-2.5 py-1.5" placeholder="e.g. white wall-hung sink, 34 in high">
-    <button data-apply class="mt-2 w-full text-sm font-semibold bg-ink text-white rounded-lg px-3 py-2 hover:bg-brand-700">Preview in this home</button></div>`;
-}
-async function analyze(sel, instruction) {
-  const t = thinking('Looking at your selection');
-  try {
-    const res = await fetch(`/api/home/${H.id}/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ crop: sel.crop, full: sel.full, instruction, room: sel.roomLabel, needs: NEEDS,
-        size: sel.world && { w: sel.world.w, h: sel.world.h, d: sel.world.d, rise: sel.world.rise } }) }).then((r) => r.json());
-    t.remove();
-    if (res.error) { bubble(`<span class="text-red-600">${res.error}</span>`); return; }
-    sel.item = res.items?.[0]?.name || ''; sel.label = sel.item || 'Selection';
-    const lbl = sel.box?.querySelector('.sel-label'); if (lbl) lbl.textContent = sel.label;
-    renderSelChips();
-    bubble(`<div class="flex gap-3 items-start"><img src="${sel.crop}" class="w-12 h-12 rounded-lg object-cover shrink-0">
-      <div class="text-sm"><div class="font-semibold">${sel.label}</div><div class="text-slate-600">${res.summary || ''}</div>
-      ${(res.items || []).length ? `<details class="mt-1 text-xs text-slate-500"><summary class="cursor-pointer">What I see</summary><ul class="mt-1 list-disc pl-4">${res.items.map((i) => `<li><b>${i.name}</b>: ${i.observation}</li>`).join('')}</ul></details>` : ''}</div></div>
-      ${(res.changes || []).map((c) => changeCard(sel, c)).join('')}`);
-    chatHistory.push({ role: 'assistant', content: `Selection "${sel.label}": ${res.summary}` });
-  } catch { t.remove(); bubble('<span class="text-red-600">Could not analyze that selection.</span>'); }
-}
+const CHANGE_RE = /(make|turn|change|replace|remove|add|convert|swap|put|install|get rid|widen|lower|raise|build|design|walk-?in|ramp|grab bar|stairlift|seat|door|shower|accessible)/i;
 $('#chat-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const msg = $('#chat-input').value.trim(); if (!msg) return;
   $('#chat-input').value = ''; stopAgent();
-  bubble(msg, 'user'); chatHistory.push({ role: 'user', content: msg });
-  if (selections.length) { for (const s of selections) await analyze(s, msg); return; }
-  if (CHANGE_RE.test(msg)) { await findInView(msg); return; }   // no selection: find what they mean in the current view
+  bubble(esc(msg), 'user'); chatHistory.push({ role: 'user', content: msg });
+  if (selections.length) { for (const s of [...selections]) command(s, msg, msg); return; }
+  if (CHANGE_RE.test(msg) && sdk) {     // no selection: the agent looks at your current view to find what you mean
+    const sel = await makeSelection({ x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, null, { silent: true, whole: true });
+    command(sel, msg, msg); return;
+  }
   const t = thinking();
   const res = await fetch(`/api/home/${H.id}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: msg, history: chatHistory, edits: edits.map((e) => `${e.title} (${money(e.cost)})`) }) }).then((r) => r.json());
-  t.remove(); bubble((res.reply || '').replace(/\n/g, '<br>')); chatHistory.push({ role: 'assistant', content: res.reply });
+  t.remove(); bubble(esc(res.reply || '').replace(/\n/g, '<br>')); chatHistory.push({ role: 'assistant', content: res.reply });
 });
+$('#chat-clear').onclick = () => { $('#chat').innerHTML = ''; chatHistory = []; };
 
-const CHANGE_RE = /(make|turn|change|replace|remove|add|convert|swap|put|install|get rid|widen|lower|raise|build|design|walk-?in|ramp|grab bar|stairlift|seat|door)/i;
-async function findInView(msg) {
-  const t = thinking('Finding that in your view');
-  const image = await grabFrame();
-  const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ views: [{ image, room: currentRoom()?.label || '' }], needs: NEEDS, instruction: msg,
-      persona: sessionStorage.getItem('fd-persona') || '' }) }).then((r) => r.json()).catch(() => ({}));
-  t.remove();
-  const f = (plan.findings || [])[0];
-  if (!f?.box_2d) { bubble(`I couldn't spot that in this view. Turn toward it, or click <b>Select to change</b> and drag a box around it.`); return; }
-  const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d;
-  const rect = { x: b[1] / 1000 * W, y: b[0] / 1000 * Hh, w: (b[3] - b[1]) / 1000 * W, h: (b[2] - b[0]) / 1000 * Hh };
-  clearSelections();
-  const sel = await makeSelection(rect, null, { item: f.item, label: f.item || 'Found', silent: true });
-  bubble(`<div class="flex gap-3 items-start"><img src="${sel.crop}" class="w-12 h-12 rounded-lg object-cover shrink-0">
-    <div class="text-sm"><div class="font-semibold">${f.item || ''}</div><div class="text-slate-600">${f.issue || ''}</div></div></div>${changeCard(sel, f)}`);
-}
-
-/* ---------------- agent first pass (only when you ask; stops as soon as you take over) ---------------- */
-const ROOM_PRIORITY = [/bath/i, /stair|hall/i, /bedroom/i, /kitchen/i, /laundry/i, /garage|entry|foyer/i];
-let agentAbort = false;
+/* ================= guided tour: the agent walks you room by room ================= */
+const ROOM_PRIORITY = [/bath/i, /bedroom/i, /stair|hall/i, /kitchen/i, /laundry/i, /entry|foyer/i];
 function agentRooms() {
   const picks = [];
   for (const re of ROOM_PRIORITY) for (const r of roomList) if (re.test(r.label) && !picks.includes(r)) picks.push(r);
-  return picks.filter((r) => !/closet|pantry/i.test(r.label)).slice(0, 3);
-}
-function offerAgent() {
-  const el = bubble(`<div class="font-semibold">Want me to check this home for you?</div>
-    <div class="text-sm text-slate-600 mt-0.5">I'll walk the bathrooms and bedrooms, find what doesn't fit your needs and show the fixes with prices. It takes about a minute and moves the tour while it works.</div>
-    <div class="mt-2 flex gap-2"><button data-go class="text-sm font-semibold bg-brand-600 text-white rounded-lg px-3 py-1.5 hover:bg-brand-700">Check this home</button>
-    <button data-no class="text-sm text-slate-600 rounded-lg px-3 py-1.5 hover:bg-slate-100">I'll look myself</button></div>`);
-  el.querySelector('[data-go]').onclick = () => { el.remove(); startAgent(); };
-  el.querySelector('[data-no]').onclick = () => el.remove();
+  return picks.filter((r) => !/closet|pantry|garage/i.test(r.label)).slice(0, 4);
 }
 function stopAgent() { if (agentBusy) agentAbort = true; }
 async function startAgent() {
   if (agentBusy || !roomList.length) return;
-  agentBusy = true; agentAbort = false; setMode('walk');
-  try { await runAgent(); } catch (err) { console.error(err); bubble(`<span class="text-red-600">Agent stopped: ${err.message}</span>`); }
+  agentBusy = true; agentAbort = false; setMode('walk'); closeDrawers();
+  try { await guidedTour(); } catch (err) { console.error(err); bubble(`<span class="text-red-600">Tour stopped: ${esc(err.message)}</span>`); }
   finally { agentBusy = false; renderMissingViews(); }
 }
-async function runAgent() {
+$('#agent-run').onclick = startAgent;
+$('#qa-guided').onclick = startAgent;
+async function guidedTour() {
   for (let i = 0; i < 50 && !poseCache; i++) await sleep(100);
-  await sleep(1200);
-  const startSweep = lastSweep, startRot = { ...poseCache.rotation };
   const rooms = agentRooms();
-  const log = bubble(`<div class="flex items-center"><div class="font-semibold">Checking ${rooms.map((r) => r.label).join(', ')}</div>
-    <button data-stop class="ml-auto text-xs text-slate-500 hover:text-red-600 border rounded-md px-2 py-0.5">Stop</button></div><ul class="mt-2 text-sm space-y-2" data-steps></ul>`);
-  log.querySelector('[data-stop]').onclick = () => { agentAbort = true; };
-  const step = (t) => { const li = document.createElement('li'); li.innerHTML = t; log.querySelector('[data-steps]').appendChild(li); $('#chat').scrollTop = 1e9; return li; };
-  let found = 0;
+  bubble(`<div class="font-semibold">Let's walk through it together</div><div class="text-sm text-slate-600 mt-0.5">I'll take you to ${rooms.map((r) => esc(r.label)).join(', ')}.
+    In each room I'll point out what gets in the way${NEEDS.length ? ' for your needs' : ''} and show the fix. You choose what to keep; I'll skip extras that don't help.
+    ${BUDGET ? `Your budget is ${money(BUDGET)}.` : ''}</div>`);
+  let accepted = 0;
   for (const room of rooms) {
     if (agentAbort) break;
-    const li = step(`<span class="dots">${room.label}: looking around<span>.</span><span>.</span><span>.</span></span>`);
-    await soon(sdk.Sweep.moveTo(centerSweep(room).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 600 }));
+    const step = thinking(`Walking to ${room.label}`);
+    await soon(sdk.Sweep.moveTo(centerSweep(room).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }));
     await sleep(900);
     const views = [];
     for (let k = 0; k < 4 && !agentAbort; k++) {
-      await lookAt({ x: -18, y: k * 90 }); await sleep(450);
-      views.push({ image: await soon(sdk.Renderer.takeScreenShot({ width: 768, height: 576 }, { mattertags: false, sweeps: false }), 8000), room: room.label, rot: { x: -18, y: k * 90 } });
+      await lookAt({ x: -15, y: k * 90 }); await sleep(400);
+      views.push({ image: await soon(sdk.Renderer.takeScreenShot({ width: 768, height: 576 }, { mattertags: false, sweeps: false }), 8000), room: room.label, rot: { x: -15, y: k * 90 } });
     }
-    if (agentAbort) { li.remove(); break; }
+    if (agentAbort) { step.remove(); break; }
     const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ views, needs: NEEDS, persona: sessionStorage.getItem('fd-persona') || '' }) }).then((r) => r.json()).catch(() => ({}));
-    if (agentAbort) { li.remove(); break; }
-    const f = (plan.findings || [])[0];
-    if (!f) { li.innerHTML = `✓ ${room.label}: fine as is`; continue; }
-    li.innerHTML = `<span class="dots">${room.label}: ${f.item}. Rendering <b>${f.title}</b><span>.</span><span>.</span><span>.</span></span>`;
-    await lookAt(views[f.view]?.rot || views[0].rot); await sleep(700);
-    const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d || [300, 300, 700, 700];
+      body: JSON.stringify({ views, needs: NEEDS, persona: PERSONA, existing: edits.map((x) => `${x.room}: ${x.title}`) }) }).then((r) => r.json()).catch(() => ({}));
+    step.remove();
+    if (agentAbort) break;
+    const f = (plan.findings || []).find((x) => x.fits_needs !== false) || null;
+    if (!f) { bubble(`<b>${esc(room.label)}</b>: nothing here gets in your way. 👍`); continue; }
+    await lookAt(views[f.view]?.rot || views[0].rot); await sleep(500);
+    const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d || [250, 250, 750, 750];
     const rect = { x: b[1] / 1000 * W, y: b[0] / 1000 * Hh, w: (b[3] - b[1]) / 1000 * W, h: (b[2] - b[0]) / 1000 * Hh };
-    const sel = await makeSelection(rect, null, { item: f.item, label: f.item, silent: true });
-    selections = selections.filter((x) => x !== sel); renderSelChips();
-    const opt = (f.options || [])[1] || (f.options || [])[0];
-    const { meta } = await applyChange(sel, f, opt, '', true);
-    found += meta ? 1 : 0;
-    li.innerHTML = meta ? `✅ ${room.label}: <b>${f.title}</b>, ${opt?.name || ''} (${money(opt?.total)})${compareHtml(meta.id)}` : `⚠️ ${room.label}: couldn't render ${f.title}`;
+    const outline = screenOutline(rect, null);
+    const opt = (f.options || [])[Math.min(1, (f.options || []).length - 1)];
+    const k = await ask(`<div class="text-xs font-semibold text-slate-500 uppercase">${esc(room.label)}</div>
+      <div class="font-semibold">${esc(f.item)}: ${esc(f.issue)}</div>
+      <div class="text-sm text-slate-600 mt-0.5">Suggested: <b>${esc(f.title)}</b>${opt ? `, e.g. ${esc(opt.name)} for about ${money(opt.total)} (item ${money(opt.material)} + labor ${money(opt.labor)})` : ''}.</div>
+      ${f.advice ? `<div class="text-sm text-slate-500 mt-0.5">${esc(f.advice)}</div>` : ''}`,
+      [['yes', 'Show me this fix'], ['skip', 'Skip'], ['stop', 'End tour']]);
+    outline.remove();
+    if (k === 'stop' || agentAbort) { agentAbort = true; break; }
+    if (k === 'skip') continue;
+    const sel = await makeSelection(rect, null, { silent: true, item: f.item });
+    accepted++;
+    command(sel, f.title, f.title, { ...f, box_2d: null });     // renders in the background while we keep walking
+    bubble(`<div class="text-sm">On it. I'll show you <b>${esc(f.title)}</b> as soon as it's ready; let's keep going.</div>`);
   }
-  if (agentAbort) { step('Stopped. The tour is yours.'); return; }
-  step(found ? `<b>${found} change${found > 1 ? 's' : ''}</b> added. Walk around to see them; swap products or switch them off in <b>Plan</b>.` : 'Nothing to change for your needs.');
-  await soon(sdk.Sweep.moveTo(startSweep, { transition: sdk.Sweep.Transition.FLY, transitionTime: 600 }));
-  await lookAt(startRot);
+  const total = edits.filter((x) => x.on !== false && x.status !== 'failed').reduce((s, x) => s + (x.cost || 0), 0);
+  bubble(agentAbort ? 'Tour ended. The home is yours to explore.' :
+    `<div class="font-semibold">That's the tour.</div><div class="text-sm text-slate-600">${accepted ? `${accepted} change${accepted > 1 ? 's' : ''} on the way (${money(total)} so far${BUDGET ? `; ${H.price + total <= BUDGET ? 'within' : 'over'} your ${money(BUDGET)} budget` : ''}).` : 'No changes needed.'}
+     Cards on the tour tell you when each is ready. Circle anything else you'd like to change.</div>`);
 }
-$('#agent-run').onclick = () => startAgent();
 
-/* ---------------- plan / persistence ---------------- */
+/* ================= changes drawer, undo, compare ================= */
 function save() { try { localStorage.setItem(STORE, JSON.stringify(edits)); } catch {} }
 async function restoreEdits() {
   try { edits = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch { edits = []; }
-  for (const e of edits) {
-    if (e.status === 'analyzing' || e.status === 'rendering') { e.status = e.patches.length ? 'done' : 'failed'; e.error = e.error || 'interrupted by a page reload'; }
-    await mountBox(e); for (const p of e.patches) await mountPatch(e, p);
-  }
-  refreshVisibility(); renderPlan();
+  edits = edits.filter((e) => e.status === 'ready' && e.patches.length);   // unfinished work can't resume after a reload
+  for (const e of edits) for (const p of e.patches) await mountPatch(e, p);
+  save(); refreshVisibility(); renderPlan();
 }
-function removeEdit(id) {
-  const L = live[id];
-  if (L) { L.box?.stop(); Object.values(L.patches).forEach((n) => n.stop()); delete live[id]; }
-  edits = edits.filter((e) => e.id !== id); save(); renderPlan();
+function removeEdit(id, quiet = false) {
+  const e = edits.find((x) => x.id === id); if (!e) return;
+  Object.values(live[id]?.patches || {}).forEach((n) => n.stop()); delete live[id];
+  edits = edits.filter((x) => x.id !== id); document.getElementById('job-' + id)?.remove();
+  save(); renderPlan();
+  if (!quiet) hint(`Removed “${esc(e.title)}”.`, 3000);
 }
-function swapOption(id, i) {     // a different product: drop old renders, re-render where you stand
+function undo() { const e = [...edits].reverse().find((x) => x.status === 'ready' || x.status === 'failed'); if (e) removeEdit(e.id); }
+$('#undo').onclick = undo;
+async function swapOption(id, i) {
   const e = edits.find((x) => x.id === id); if (!e || !e.options[i]) return;
-  e.option = e.options[i]; e.cost = e.option.total; e.ref = null;
-  const L = live[id]; Object.values(L?.patches || {}).forEach((n) => n.stop()); if (L) L.patches = {};
-  e.patches = []; save(); renderPlan();
+  e.option = e.options[i]; e.cost = e.option.total; e.ref = null; e.custom = '';
   const sel = selFor.get(id);
-  if (sel) runRender(e, sel); else renderMissingViews();   // re-render from the original view if we still have it
+  if (sel) renderAndReview(e, sel).catch((err) => setStatus(e, 'failed', { error: err.message }));
+  else { for (const p of [...e.patches]) dropPatch(e, p); save(); renderPlan(); hint('Walk back to it and it will re-render with the new product.', 4000); }
 }
+const PILL = {
+  understanding: ['Thinking…', 'text-brand-700 bg-brand-50 animate-pulse'], designing: ['Pricing…', 'text-brand-700 bg-brand-50 animate-pulse'],
+  rendering: ['Rendering…', 'text-amber-700 bg-amber-50 animate-pulse'], fixing: ['Improving…', 'text-amber-700 bg-amber-50 animate-pulse'],
+  checking: ['Checking…', 'text-sky-700 bg-sky-50 animate-pulse'], ready: ['Ready', 'text-emerald-700 bg-emerald-50'], failed: ['Failed', 'text-red-700 bg-red-50'],
+};
 function renderPlan() {
-  const on = edits.filter((e) => e.on !== false);
+  const on = edits.filter((e) => e.on !== false && e.status === 'ready');
   const total = on.reduce((s, e) => s + (e.cost || 0), 0), labor = on.reduce((s, e) => s + (e.option?.labor || 0), 0);
   $('#plan-count').textContent = edits.length;
-  const pill = (e) => ({ analyzing: '<span class="text-[11px] font-semibold text-brand-700 bg-brand-50 rounded-full px-2 py-0.5 animate-pulse">Thinking…</span>',
-    rendering: '<span class="text-[11px] font-semibold text-amber-700 bg-amber-50 rounded-full px-2 py-0.5 animate-pulse">Rendering…</span>',
-    failed: `<span class="text-[11px] font-semibold text-red-700 bg-red-50 rounded-full px-2 py-0.5" title="${(e.error || '').replace(/"/g, '')}">Failed</span>`,
-  })[e.status] || '<span class="text-[11px] font-semibold text-emerald-700 bg-emerald-50 rounded-full px-2 py-0.5">Ready</span>';
-  $('#plan').innerHTML = [...edits].reverse().map((e) => `<li class="border border-slate-100 rounded-xl p-2.5 ${e.on === false ? 'opacity-50' : ''}">
+  $('#plan').innerHTML = [...edits].reverse().map((e) => {
+    const [pl, pc] = PILL[e.status] || PILL.ready;
+    return `<li class="border border-slate-100 rounded-xl p-2.5 ${e.on === false ? 'opacity-60' : ''}">
     <div class="flex items-start gap-2.5">
       <button data-go="${e.id}" class="shrink-0 w-16 h-16 rounded-lg overflow-hidden bg-slate-100" title="Show it in the tour">
-        <img src="${e.thumb ? `/api/home/${H.id}/render/${e.thumb}/patch` : (e.crop || '')}" class="w-full h-full object-cover" alt=""></button>
+        <img src="${e.patches[0] ? `/api/home/${H.id}/render/${e.patches[0].rid}/after` : (e.crop || '')}" class="w-full h-full object-cover" alt=""></button>
       <div class="flex-1 min-w-0">
-        <div class="flex items-center gap-1.5">${pill(e)}${e.agent ? '<span class="text-[10px] bg-brand-100 text-brand-700 rounded px-1">agent</span>' : ''}<span class="ml-auto font-semibold text-sm">${e.cost ? money(e.cost) : ''}</span></div>
-        <div class="font-medium text-sm leading-tight mt-0.5">${e.title}</div>
-        <div class="text-xs text-slate-500">${e.room || ''}${e.option ? ` · item ${money(e.option.material)} + labor ${money(e.option.labor)}` : ''}</div>
-        ${e.options?.length > 1 && e.status === 'done' ? `<select data-swap="${e.id}" class="mt-1 max-w-full text-xs border rounded px-1 py-0.5">${e.options.map((o, i) => `<option value="${i}" ${o.name === e.option?.name ? 'selected' : ''}>${o.tier}: ${o.name} (${money(o.total)})</option>`).join('')}</select>` : ''}
+        <div class="flex items-center gap-1.5"><span class="text-[11px] font-semibold rounded-full px-2 py-0.5 ${pc}">${pl}</span><span class="ml-auto font-semibold text-sm">${e.cost ? money(e.cost) : ''}</span></div>
+        <div class="font-medium text-sm leading-tight mt-0.5">${esc(e.title)}</div>
+        <div class="text-xs text-slate-500">${esc(e.room)}${e.option ? ` · item ${money(e.option.material)} + labor ${money(e.option.labor)}` : ''}</div>
+        ${e.options?.length > 1 && e.status === 'ready' ? `<select data-swap="${e.id}" class="mt-1 max-w-full text-xs border rounded px-1 py-0.5">${e.options.map((o, i) => `<option value="${i}" ${o.name === e.option?.name ? 'selected' : ''}>${esc(o.tier)}: ${esc(o.name)} (${money(o.total)})</option>`).join('')}</select>` : ''}
         <div class="mt-1 flex items-center gap-3 text-xs">
-          <label class="flex items-center gap-1 text-slate-500"><input type="checkbox" data-on="${e.id}" ${e.on !== false ? 'checked' : ''} class="accent-brand-600">Include</label>
-          <button data-go="${e.id}" class="text-brand-700 font-semibold">View</button>
-          <button data-del="${e.id}" class="text-slate-400 hover:text-red-600 ml-auto">Delete</button></div></div></div></li>`).join('')
-    || '<li class="text-sm text-slate-500">No changes yet.</li>';
+          ${e.status === 'ready' ? `<label class="flex items-center gap-1 text-slate-600"><input type="checkbox" data-on="${e.id}" ${e.on !== false ? 'checked' : ''} class="accent-brand-600">Show</label>
+          <button data-go="${e.id}" class="text-brand-700 font-semibold">View</button>` : ''}
+          <button data-del="${e.id}" class="text-slate-400 hover:text-red-600 ml-auto">Delete</button></div></div></div></li>`;
+  }).join('') || '<li class="text-sm text-slate-500 p-2">Nothing yet. Click <b>✎ Change something</b> and circle anything in the tour, or take the guided tour.</li>';
   $('#plan').querySelectorAll('[data-del]').forEach((b) => b.onclick = () => removeEdit(b.dataset.del));
   $('#plan').querySelectorAll('[data-go]').forEach((b) => b.onclick = () => flyTo(edits.find((e) => e.id === b.dataset.go)));
   $('#plan').querySelectorAll('[data-on]').forEach((b) => b.onchange = () => { const e = edits.find((x) => x.id === b.dataset.on); e.on = b.checked; save(); refreshVisibility(); renderPlan(); });
@@ -740,79 +675,92 @@ function renderPlan() {
   $('#c-mods').textContent = money(total);
   $('#c-price').textContent = money(H.price) + (H.rent ? '/mo' : '');
   $('#c-true').textContent = H.rent ? `${money(H.price)}/mo + ${money(total)}` : money(H.price + total);
+  const b = $('#budget');
+  if (BUDGET && !H.rent) { const left = BUDGET - H.price - total; b.textContent = left >= 0 ? `· ${money(left)} under budget` : `· ${money(-left)} over budget`; b.className = 'text-xs font-semibold ' + (left >= 0 ? 'text-emerald-600' : 'text-red-600'); }
 }
-$('#plan-clear').onclick = () => [...edits].forEach((e) => removeEdit(e.id));
+$('#plan-clear').onclick = () => [...edits].forEach((e) => removeEdit(e.id, true));
 async function flyTo(e) {
   if (!e?.patches.length) return;
-  switchView('tour');
-  await sdk.Sweep.moveTo(e.patches[0].sweep, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }).catch(() => {});
-  await lookAt(e.patches[0].rot || poseCache.rotation);   // the exact angle it was rendered from
+  switchView('tour'); closeDrawers(); setView('after');
+  const p = e.patches.find((x) => !x.extra) || e.patches[0];
+  await soon(sdk.Sweep.moveTo(p.sweep, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }));
+  await lookAt(p.rot || poseCache.rotation);
+  hint(`<b>${esc(e.title)}</b>. Hold <b>B</b> or flip <b>Your changes</b> to compare with today.`, 5000);
 }
 function setView(v) {
   view = v; refreshVisibility();
-  for (const [id, k] of [['#ba-orig', 'orig'], ['#ba-before', 'plan'], ['#ba-after', 'after']]) $(id).className = 'px-3.5 py-1.5 rounded-full ' + (v === k ? 'bg-white text-ink' : '');
-  if (v === 'after') renderMissingViews();
+  const on = v === 'after';
+  $('#compare-dot').className = 'w-9 h-6 rounded-full relative transition ' + (on ? 'bg-brand-600' : 'bg-slate-300');
+  $('#compare-dot').firstElementChild.className = 'absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition ' + (on ? 'right-0.5' : 'left-0.5');
+  $('#compare-label').textContent = on ? 'Your changes on' : 'Today (as listed)';
+  if (on) renderMissingViews();
 }
-$('#ba-orig').onclick = () => setView('orig');
-$('#ba-before').onclick = () => setView('plan');
-$('#ba-after').onclick = () => setView('after');
+$('#compare').onclick = () => setView(view === 'after' ? 'orig' : 'after');
 
-/* ---------------- side panels ---------------- */
+/* ================= drawers, tabs, panels ================= */
+function closeDrawers() { document.querySelectorAll('[data-drawer-panel]').forEach((d) => d.classList.remove('open')); }
+document.querySelectorAll('[data-drawer]').forEach((b) => b.onclick = () => {
+  const d = document.querySelector(`[data-drawer-panel="${b.dataset.drawer}"]`), open = d.classList.contains('open');
+  closeDrawers();
+  if (!open) { d.classList.add('open'); if (b.dataset.drawer === 'outside' && !$('#aerial-thumb').src) $('#aerial-thumb').src = `/api/home/${H.id}/aerial.jpg`; }
+});
+document.querySelectorAll('[data-drawer-panel] [data-close]').forEach((b) => b.onclick = closeDrawers);
+function switchView(v) {
+  document.querySelectorAll('.view-tab').forEach((b) => b.className = 'view-tab px-4 py-1.5 rounded-full ' + (b.dataset.view === v ? 'bg-brand-600 text-white' : ''));
+  $('#photos').classList.toggle('hidden', v !== 'photos');
+}
+document.querySelectorAll('.view-tab').forEach((b) => b.onclick = () => switchView(b.dataset.view));
 const STATUS = { yes: ['✓', 'Yes'], likely: ['◐', 'Likely'], unknown: ['?', 'Unknown'], no: ['✕', 'No'] };
 function renderAccess(d) {
   const wanted = NEEDS.length ? NEEDS : Object.keys(d.evidence);
   const ev = Object.entries(d.evidence).sort(([a], [b]) => wanted.includes(b) - wanted.includes(a));
   $('#evidence').innerHTML = ev.map(([k, v]) => `<li class="border border-slate-100 rounded-xl p-3 ${wanted.includes(k) ? '' : 'opacity-60'}">
-    <div class="flex items-center gap-2"><span class="status-${v.status} font-bold">${STATUS[v.status][0]}</span><span class="font-medium">${v.label}</span>
+    <div class="flex items-center gap-2"><span class="status-${v.status} font-bold">${STATUS[v.status][0]}</span><span class="font-medium">${esc(v.label)}</span>
     <span class="ml-auto text-xs status-${v.status} font-semibold">${STATUS[v.status][1]}</span></div>
-    ${v.evidence ? `<div class="text-xs text-slate-500 mt-1">${v.evidence}</div>` : ''}</li>`).join('')
-    + (d.scan?.findings || []).map((f) => `<li class="border border-brand-100 bg-brand-50/50 rounded-xl p-3 text-sm"><b>3D scan:</b> ${f.evidence.replace('3D scan: ', '')}</li>`).join('');
+    ${v.evidence ? `<div class="text-xs text-slate-500 mt-1">${esc(v.evidence)}</div>` : ''}</li>`).join('')
+    + (d.scan?.findings || []).map((f) => `<li class="border border-brand-100 bg-brand-50/50 rounded-xl p-3 text-sm"><b>3D scan:</b> ${esc(f.evidence.replace('3D scan: ', ''))}</li>`).join('');
   const rooms = d.scan?.rooms || [];
-  $('#rooms').innerHTML = rooms.length ? `<table class="w-full"><tbody>${rooms.map((r) => `<tr class="border-t border-slate-100"><td class="py-1.5">${r.type}</td><td>${r.floor || ''}</td><td class="text-right">${r.width_ft ? `${r.width_ft.toFixed(1)} × ${(r.depth_ft || 0).toFixed(1)} ft` : '—'}</td></tr>`).join('')}</tbody></table>` : '';
+  $('#rooms').innerHTML = rooms.map((r) => `<div class="flex justify-between border-t border-slate-100 py-1"><span>${esc(r.type)}</span><span class="text-slate-500">${r.width_ft ? `${r.width_ft.toFixed(1)} × ${(r.depth_ft || 0).toFixed(1)} ft` : ''}</span></div>`).join('');
+  $('#score').textContent = d.match; $('#score-bar').style.width = d.match + '%';
+  const tag = d.match >= 85 ? ['Highly accessible', 'bg-emerald-50 text-emerald-700'] : d.match >= 65 ? ['Accessible with changes', 'bg-sky-50 text-sky-700'] : ['Needs work', 'bg-amber-50 text-amber-700'];
+  $('#score-tag').textContent = tag[0]; $('#score-tag').className = 'text-xs font-semibold rounded-full px-2 py-0.5 ' + tag[1];
+  const yes = ev.filter(([k, v]) => v.status === 'yes' && wanted.includes(k)).map(([, v]) => v.label);
+  $('#features').innerHTML = (yes.length ? yes.slice(0, 3) : ['Nothing confirmed yet']).map((t) => `<li>${yes.length ? '✓ ' : ''}${esc(t)}</li>`).join('');
 }
 async function loadOutside() {
   const a = await fetch(`/api/home/${H.id}/aerial`).then((r) => r.json());
-  const row = (k, v) => `<div class="bg-slate-50 rounded-xl p-3"><dt class="text-xs text-slate-500">${k}</dt><dd class="font-semibold">${v ?? '—'}</dd></div>`;
-  $('#outside').innerHTML = a.found ? [row('Footprint', a.footprint_sqft ? Math.round(a.footprint_sqft).toLocaleString() + ' sq ft' : null),
-    row('Tree cover', a.tree_cover_pct != null ? a.tree_cover_pct + '%' : null), row('Pool', a.pool ? 'Yes' : 'No'), row('Deck', a.deck ? 'Yes' : 'No'),
-    row('Roof', a.roof), row('Lot', H.lot_acres ? H.lot_acres.toFixed(2) + ' acres' : null)].join('') : '<p class="col-span-2 text-slate-500">No parcel data here.</p>';
+  const row = (k, v) => `<div class="bg-slate-50 rounded-xl p-2.5"><dt class="text-xs text-slate-500">${k}</dt><dd class="font-semibold">${esc(v ?? '—')}</dd></div>`;
+  $('#outside').innerHTML = a.found ? [row('Home footprint', a.footprint_sqft ? Math.round(a.footprint_sqft).toLocaleString() + ' sq ft' : null),
+    row('Lot', H.lot_acres ? H.lot_acres.toFixed(2) + ' acres' : null), row('Shade trees', a.tree_cover_pct != null ? a.tree_cover_pct + '% cover' : null),
+    row('Pool', a.pool ? 'Yes (fence it for safety)' : 'No'), row('Deck', a.deck ? 'Yes' : 'No'), row('Roof', a.roof)].join('')
+    : '<p class="col-span-2 text-slate-500">No parcel data here.</p>';
 }
-function switchView(v) {
-  document.querySelectorAll('.view-tab').forEach((b) => b.className = 'view-tab px-4 py-1.5 rounded-full ' + (b.dataset.view === v ? 'bg-white text-ink' : ''));
-  $('#aerial').classList.toggle('hidden', v !== 'aerial'); $('#photos').classList.toggle('hidden', v !== 'photos');
-  $('#tour-tools').style.visibility = v === 'tour' ? 'visible' : 'hidden';
-  if (v === 'aerial' && !$('#aerial').src) $('#aerial').src = `/api/home/${H.id}/aerial.jpg`;
-}
-document.querySelectorAll('.view-tab').forEach((b) => b.onclick = () => switchView(b.dataset.view));
-$('#aerial-thumb').onclick = () => switchView('aerial');
-document.querySelectorAll('#panel-tabs .tab-btn').forEach((b) => b.onclick = () => {
-  document.querySelectorAll('#panel-tabs .tab-btn').forEach((x) => x.setAttribute('aria-selected', x === b));
-  document.querySelectorAll('[data-panel]').forEach((p) => p.classList.toggle('hidden', p.dataset.panel !== b.dataset.tab));
-});
 let hintTimer;
 function hint(html, ms) { const h = $('#hint'); h.innerHTML = html; h.style.opacity = 1; clearTimeout(hintTimer); if (ms) hintTimer = setTimeout(() => h.style.opacity = 0, ms); }
-function status(t) { const s = $('#render-status'); s.textContent = t; s.classList.toggle('hidden', !t); }
+
+function welcome() {
+  if (edits.length) { bubble(`Welcome back. Your ${edits.length} change${edits.length > 1 ? 's are' : ' is'} in the tour. Open <b>Changes</b> to turn them on or off.`); return; }
+  const needs = NEEDS.map((k) => info?.evidence?.[k]?.label?.toLowerCase()).filter(Boolean);
+  const el = bubble(`<div class="font-semibold">Hi! I'm your guide for this home.</div>
+    <div class="text-sm text-slate-600 mt-1">${needs.length ? `You told me you need ${needs.join(', ')}. ` : ''}I can walk you room by room and show what this home would look like with the changes you need, with real prices.</div>
+    <div class="mt-2 flex flex-wrap gap-2"><button data-go class="text-sm font-semibold bg-brand-600 text-white rounded-lg px-3 py-1.5 hover:bg-brand-700">Walk me through it</button>
+    <button data-self class="text-sm border rounded-lg px-3 py-1.5 hover:bg-slate-50">I'll explore myself</button></div>`);
+  el.querySelector('[data-go]').onclick = () => { el.querySelectorAll('button').forEach((b) => b.disabled = true); startAgent(); };
+  el.querySelector('[data-self]').onclick = () => { el.querySelectorAll('button').forEach((b) => b.disabled = true);
+    bubble('Great. Drag to look around; click the floor to move. When something should be different, click <b>✎ Change something</b>, circle it, and tell me what you want.'); };
+}
 
 (async () => {
   renderPlan();
   info = await fetch(`/api/home/${H.id}?needs=${NEEDS.join(',')}`).then((r) => r.json());
   renderAccess(info); loadOutside();
-  const v = info.evidence;
-  const lines = NEEDS.map((k) => v[k]).filter(Boolean);
-  bubble(`<div class="flex items-baseline gap-2"><div class="text-2xl font-extrabold text-brand-700">${info.match}%</div><div class="font-semibold">match for your needs</div></div>
-    ${lines.length ? `<ul class="mt-1 text-sm grid grid-cols-2 gap-x-3">${lines.map((x) => `<li><span class="status-${x.status} font-bold">${STATUS[x.status][0]}</span> ${x.label}</li>`).join('')}</ul>` : ''}
-    <ol class="mt-3 text-sm text-slate-600 space-y-1 list-decimal pl-5">
-      <li>Walk around the tour (drag to look, click the floor to move).</li>
-      <li>Click <b>Select to change</b> and drag a box around anything.</li>
-      <li>Pick an option and press <b>Preview in this home</b>.</li></ol>`);
 })();
 
-/* hooks for the issue reporter (report.js): capture the 3D view and the app state */
+/* hooks for the issue reporter (report.js) */
 window.FD_SHOT = async () => {
   const W = iframe.clientWidth, Hh = iframe.clientHeight;
   const tour = sdk ? await soon(sdk.Renderer.takeScreenShot({ width: W, height: Hh }, { mattertags: false, sweeps: true }), 6000) : null;
   if (!tour) throw new Error('no tour');
-  // draw the visible selection boxes on top so the report shows what was selected
   const img = new Image(); img.src = tour; await img.decode();
   const c = document.createElement('canvas'); c.width = W; c.height = Hh; const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, W, Hh);
   ctx.strokeStyle = '#7c5cff'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
@@ -820,10 +768,10 @@ window.FD_SHOT = async () => {
   return c.toDataURL('image/png');
 };
 window.FD_CONTEXT = async () => ({
-  home: { id: H.id, address: H.address, matterport: H.matterport_id }, needs: NEEDS, view, mode, agentBusy, applying,
+  home: { id: H.id, address: H.address, matterport: H.matterport_id }, needs: NEEDS, budget: BUDGET, view, mode, agentBusy,
   pose: poseCache && { sweep: poseCache.sweep, position: poseCache.position, rotation: poseCache.rotation, mode: poseCache.mode },
   room: currentRoom()?.label || null,
-  selections: selections.map((s) => ({ label: s.label, rect: s.rect, pose: s.pose, world: s.world })),
-  edits: edits.map(({ options, ...e }) => e),
+  selections: selections.map((s) => ({ label: s.label, rect: s.rect, poly: s.poly?.length, pose: s.pose && { sweep: s.pose.sweep, rotation: s.pose.rotation }, world: s.world })),
+  edits: edits.map(({ options, crop, ...e }) => e),
   chat: [...document.querySelectorAll('#chat > div')].slice(-30).map((d) => d.innerText.slice(0, 600)),
 });

@@ -47,12 +47,17 @@ Click **Report issue** (top right) on any page: it screenshots what you see (the
 box or draw on what's wrong, and saves the note, screenshots and the app's state (camera position, room, selections,
 changes, recent API calls and errors) to `logs/feedback/<time>/`. Server errors go to `logs/server.log`.
 
-### Making changes
-- **Select to change** (or **S**), then **Draw** around anything (freehand) or use **Box**. **Shift** adds more.
-- A menu opens next to it: **Remove it**, **Replace with…**, **Add here…**, **What would help here?**, or type anything.
-- The selection captures that exact view, so the change renders in the background: keep walking and make more
-  changes in other rooms. Each one is highlighted in purple in 3D while it works, and the **Changes** tab shows live
-  status (Thinking → Rendering → Ready) with thumbnails, prices, product swaps and an Include toggle.
+### Making changes (the experience)
+- **Guided tour**: the agent walks you room by room, points out what gets in the way of your needs, prices a fix
+  (item + labor) and asks **Show me this fix / Skip / End tour**. It skips extras and changes you already have.
+- **Change something**: circle anything, loosely is fine. A menu offers *Make it accessible for me*, *Remove it*,
+  *Replace with…*, *Add here…*, or free text. The agent finds the whole object you meant, so a sloppy outline still works.
+- Each change runs in the background with a **processing card**: understanding → pricing → rendering → quality check
+  → ready. An independent reviewer (OpenAI, Gemini fallback) compares before/after and the render is redone with its
+  fix if it isn't a clear, finished result. When ready: **Show me** takes you to it.
+- Asking for something you already have prompts *Replace / Keep / Add both* instead of redoing it.
+- **Your changes on / Today** switch (hold **B** to peek), **Changes** drawer with Show toggles, product swap,
+  Undo (Ctrl+Z) and totals, and a budget check against the price you searched with.
 
 ### Tour controls
 - **W / S**: walk or select. Drag a box; **Shift+drag** adds more; **Esc** clears.
