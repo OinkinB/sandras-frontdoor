@@ -2,3 +2,6 @@ flask>=3.0
 python-dotenv>=1.0
 requests>=2.31
 shapely>=2.0
+pillow>=10.0
+google-auth>=2.29
+gunicorn>=22.0

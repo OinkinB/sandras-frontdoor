@@ -4,7 +4,7 @@ import re
 
 from flask import Blueprint, Response, abort, current_app, jsonify, request
 
-from ..services import ai, costs, listings, matterport, vexcel
+from ..services import ai, costs, imaging, listings, matterport, vexcel
 
 bp = Blueprint("api", __name__)
 
@@ -115,20 +115,76 @@ def _b64img(s):
     return base64.b64decode(s.split(",", 1)[-1])
 
 
+def _price_options(change):
+    """Fill in labor and totals for each product option so the UI can show a real breakdown."""
+    for o in change.get("options") or []:
+        o["material"] = int(o.get("material") or 0)
+        o["labor_hours"] = float(o.get("labor_hours") or 0)
+        o["labor_rate"] = int(o.get("labor_rate") or 85)
+        o["labor"] = int(round(o["labor_hours"] * o["labor_rate"]))
+        o["total"] = o["material"] + o["labor"]
+    return change
+
+
+def _renders_dir(home_id):
+    return current_app.config["CACHE_DIR"] / "renders" / str(home_id)
+
+
 @bp.post("/home/<int:home_id>/analyze")
 def analyze(home_id):
     _home(home_id)
     b = request.get_json(force=True)
     try:
         res = ai.analyze_selection(_b64img(b["crop"]), _b64img(b.get("full")), b.get("room", ""),
-                                   b.get("instruction"), b.get("size"))
+                                   b.get("instruction"), b.get("size"), b.get("needs"))
     except Exception as e:
         return jsonify({"error": f"AI unavailable: {e}"[:300]}), 502
     for c in res.get("changes") or []:
-        m = costs.MODS.get(c.get("mod")) or {}
-        c["model"] = m.get("model")
-        c.setdefault("cost_low", m.get("low", 0))
-        c.setdefault("cost_high", m.get("high", 0))
+        _price_options(c)
+    return jsonify(res)
+
+
+@bp.post("/home/<int:home_id>/render")
+def render(home_id):
+    """Photoreal edit of the current view. Body: image (data URL), rect [x0,y0,x1,y1] 0-1, task, ref (render id)."""
+    _home(home_id)
+    b = request.get_json(force=True)
+    out_dir = _renders_dir(home_id)
+    ref = None
+    if b.get("ref") and re.fullmatch(r"[0-9a-f]{12}", b["ref"]):
+        f = out_dir / f"{b['ref']}_ref.png"
+        ref = f.read_bytes() if f.exists() else None
+    try:
+        meta = imaging.render(_b64img(b["image"]), b["rect"], b["task"], out_dir, ref)
+    except Exception as e:
+        return jsonify({"error": f"Render failed: {e}"[:300]}), 502
+    return jsonify(meta)
+
+
+@bp.get("/home/<int:home_id>/render/<rid>/<kind>")
+def render_file(home_id, rid, kind):
+    if not re.fullmatch(r"[0-9a-f]{12}", rid) or kind not in ("patch", "after", "before", "ref"):
+        abort(404)
+    name = {"patch": f"{rid}.png", "after": f"{rid}_after.jpg", "before": f"{rid}_before.jpg", "ref": f"{rid}_ref.png"}[kind]
+    f = _renders_dir(home_id) / name
+    if not f.exists():
+        abort(404)
+    return Response(f.read_bytes(), mimetype="image/png" if name.endswith("png") else "image/jpeg",
+                    headers={"Cache-Control": "max-age=604800"})
+
+
+@bp.post("/home/<int:home_id>/agent/plan")
+def agent_plan(home_id):
+    """First pass: the agent looks at views from rooms that matter and proposes changes for this buyer."""
+    _home(home_id)
+    b = request.get_json(force=True)
+    views = [_b64img(v["image"]) for v in b.get("views") or []][:8]
+    try:
+        res = ai.agent_plan(views, [v.get("room", "") for v in b.get("views") or []], b.get("needs") or [], b.get("persona", ""))
+    except Exception as e:
+        return jsonify({"error": f"AI unavailable: {e}"[:300]}), 502
+    for f in res.get("findings") or []:
+        _price_options(f)
     return jsonify(res)
 
 
@@ -139,8 +195,5 @@ def chat(home_id):
     try:
         res = ai.chat(h, b.get("edits") or [], b.get("selection"), b.get("message", ""), b.get("history") or [])
     except Exception as e:
-        return jsonify({"reply": f"Sorry, the assistant is unavailable right now ({str(e)[:120]}).", "actions": []})
-    for a in res.get("actions") or []:
-        m = costs.MODS.get(a.get("mod")) or {}
-        a["model"] = m.get("model")
-    return jsonify(res)
+        return jsonify({"reply": f"Sorry, the assistant is unavailable right now ({str(e)[:120]})."})
+    return jsonify({"reply": res.get("reply", "")})

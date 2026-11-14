@@ -1,4 +1,8 @@
-"""LLM access: Gemini on Vertex AI (pay-per-request, no idle cost), OpenAI as fallback."""
+"""LLM access. Gemini on Vertex AI (pay per request, nothing runs while idle), OpenAI as a text fallback.
+
+Auth: on Google Cloud (Cloud Run / App Engine) the service account is used through Application
+Default Credentials; locally it falls back to the `gcloud auth login` session.
+"""
 import base64
 import json
 import os
@@ -12,35 +16,54 @@ from . import costs
 
 _token = {"value": None, "exp": 0}
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
-def _gcloud_token():
+def _access_token():
     if _token["value"] and time.time() < _token["exp"]:
         return _token["value"]
-    exe = shutil.which("gcloud") or "gcloud"
-    out = subprocess.run(f'"{exe}" auth print-access-token', shell=True, capture_output=True, text=True, timeout=60)
-    tok = out.stdout.strip()
+    tok = None
+    try:  # Application Default Credentials (service account on Cloud Run, or `gcloud auth application-default login`)
+        import google.auth
+        import google.auth.transport.requests
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        creds.refresh(google.auth.transport.requests.Request())
+        tok = creds.token
+    except Exception:
+        exe = shutil.which("gcloud") or "gcloud"
+        out = subprocess.run(f'"{exe}" auth print-access-token', shell=True, capture_output=True, text=True, timeout=60)
+        tok = out.stdout.strip()
     if not tok:
-        raise RuntimeError("gcloud token unavailable: " + out.stderr[:200])
-    _token.update(value=tok, exp=time.time() + 45 * 60)
+        raise RuntimeError("No Google Cloud credentials (run `gcloud auth login`)")
+    _token.update(value=tok, exp=time.time() + 40 * 60)
     return tok
 
 
-def _gemini(prompt, images, want_json):
+def _gemini_raw(model, parts, gen_config, timeout=180):
     proj = os.environ["GCP_PROJECT"]
-    url = (f"https://aiplatform.googleapis.com/v1/projects/{proj}/locations/global/"
-           f"publishers/google/models/{GEMINI_MODEL}:generateContent")
-    parts = [{"inlineData": {"mimeType": m, "data": base64.b64encode(b).decode()}} for m, b in images]
-    parts.append({"text": prompt})
-    body = {"contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"temperature": 0.3}}
-    if want_json:
-        body["generationConfig"]["responseMimeType"] = "application/json"
-    r = requests.post(url, json=body, timeout=120, headers={"Authorization": f"Bearer {_gcloud_token()}"})
+    url = f"https://aiplatform.googleapis.com/v1/projects/{proj}/locations/global/publishers/google/models/{model}:generateContent"
+    r = requests.post(url, json={"contents": [{"role": "user", "parts": parts}], "generationConfig": gen_config},
+                      timeout=timeout, headers={"Authorization": f"Bearer {_access_token()}"})
     r.raise_for_status()
-    parts = r.json()["candidates"][0]["content"]["parts"]
-    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    cand = (r.json().get("candidates") or [{}])[0]
+    parts = (cand.get("content") or {}).get("parts")
+    if not parts:
+        raise RuntimeError(f"model returned nothing (finishReason={cand.get('finishReason')})")
+    return parts
+
+
+def _img_part(mime, data):
+    return {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}}
+
+
+def _gemini(prompt, images, want_json):
+    parts = [_img_part(m, b) for m, b in images] + [{"text": prompt}]
+    cfg = {"temperature": 0.3}
+    if want_json:
+        cfg["responseMimeType"] = "application/json"
+    out = _gemini_raw(GEMINI_MODEL, parts, cfg)
+    return "".join(p.get("text", "") for p in out if not p.get("thought"))
 
 
 def _openai(prompt, images, want_json):
@@ -72,50 +95,20 @@ def ask(prompt, images=(), want_json=True):
     raise RuntimeError("; ".join(errors) or "no AI provider configured")
 
 
-# ---------- task prompts ----------
-
-NEED_KEYS = ["no_stairs", "step_free_entry", "wide_doorways", "walk_in_shower", "grab_bars",
-             "first_floor_bedroom", "smooth_flooring", "garage"]
-
-
-def parse_query(text: str) -> dict:
-    prompt = f"""You turn a home-seeker's request into search filters for an accessible-home search.
-Request: "{text}"
-Return JSON with keys:
- needs: array, subset of {NEED_KEYS} (infer: wheelchair -> no_stairs, step_free_entry, wide_doorways, walk_in_shower, smooth_flooring; elderly/aging in place -> no_stairs, first_floor_bedroom, grab_bars, walk_in_shower)
- max_price: number or null; min_beds: number or null
- city: "Houston" | "Los Angeles" | null
- rent: true if they want to rent, false if buy, null if unclear
- persona: one short sentence describing the user's situation
- summary: short phrase listing what you will search for"""
-    return ask(prompt)
-
-
-PARTS_SPEC = """"parts": [{"shape":"box"|"cylinder","size":[x,y,z] meters (cylinder: [diameter,height,diameter]),
-  "offset":[x,y,z] meters from the floor point under the center of the selection (x = right, y = up, z = toward the viewer),
-  "rotate":[rx,ry,rz] degrees (optional),"color":"#rrggbb","metal":0-1,"rough":0-1,"opacity":0-1 (optional, glass ~0.25)}]
-  Design it realistically at true size from simple parts (max 16), e.g. a roll-under sink, a lowered counter, a bench, a handrail."""
-
-
-def analyze_selection(crop: bytes, full: bytes, room: str, instruction: str | None, size: dict | None = None) -> dict:
-    catalog = {k: v["label"] for k, v in costs.MODS.items()}
-    dims = (f"Measured size of the selected region in the 3D scan: {size['w']:.2f} m wide, {size['h']:.2f} m tall, "
-            f"{size['d']:.2f} m deep; vertical span of the selected surfaces {size.get('rise', 0):.2f} m.") if size else ""
-    prompt = f"""You are an accessibility specialist (occupational therapist + contractor) looking at a 3D tour of a home.
-Image 1 is the region the user selected; image 2 is the full view for context. Room: {room or 'unknown'}. {dims}
-{'User instruction: ' + instruction if instruction else 'No instruction; propose the most useful accessibility changes for what is selected.'}
-Identify the objects in the selection and assess accessibility for a wheelchair user / older adult.
-Return JSON:
-{{"items":[{{"name":str,"observation":str (concrete, e.g. 'alcove bathtub, ~15 in wall to step over')}}],
- "changes":[{{"action":"remove"|"add"|"replace","mod":one of {list(catalog) + ['custom']},"title":str,"reason":str,
-             "cost_low":int,"cost_high":int, (only for mod "custom") {PARTS_SPEC}}}],
- "summary": str (1-2 sentences, plain language)}}
-Catalog with typical costs: {json.dumps({k: [v['label'], v['low'], v['high']] for k, v in costs.MODS.items()})}
-Rules: use "replace" when an existing item is swapped (tub -> walk_in_shower). For a staircase propose "stairlift" (it is
-fitted to the measured stairs automatically). If what is needed is NOT in the catalog, use mod "custom" and design it with
-"parts" sized to the measurements above. Keep costs realistic. At most 3 changes."""
-    imgs = [("image/jpeg", crop)] + ([("image/jpeg", full)] if full else [])
-    return _as_obj(ask(prompt, imgs), "changes")
+def edit_image(images: list[tuple[str, bytes]], prompt: str) -> bytes:
+    """Photoreal image edit with Gemini's image model. Returns image bytes."""
+    parts = [_img_part(m, b) for m, b in images] + [{"text": prompt}]
+    last = None
+    for attempt in range(3):          # image models occasionally return an empty candidate; retry
+        try:
+            out = _gemini_raw(IMAGE_MODEL, parts, {"responseModalities": ["IMAGE"], "temperature": 0.4 + 0.15 * attempt}, timeout=240)
+            for p in out:
+                if p.get("inlineData", {}).get("data"):
+                    return base64.b64decode(p["inlineData"]["data"])
+            last = RuntimeError("image model returned text only")
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"image model failed: {last}")
 
 
 def _as_obj(res, list_key):
@@ -127,17 +120,71 @@ def _as_obj(res, list_key):
     return res if isinstance(res, dict) else {}
 
 
+# ---------- task prompts ----------
+
+NEED_KEYS = ["no_stairs", "step_free_entry", "wide_doorways", "walk_in_shower", "grab_bars",
+             "first_floor_bedroom", "smooth_flooring", "garage"]
+
+OPTIONS_SPEC = """"options": exactly 3 real, buyable choices from budget to premium, each
+  {"tier":"Budget"|"Standard"|"Premium","name": product-style name (generic or common brand line),
+   "spec": a precise VISUAL description used to render it photorealistically (material, color, finish, size in inches),
+   "material": int USD for the item, "labor_hours": number, "labor_rate": int USD/hour for the right trade in Houston/LA,
+   "notes": short install note (permits, plumbing, blocking in wall, etc.)}"""
+
+
+def parse_query(text: str) -> dict:
+    prompt = f"""Turn a home-seeker's request into search filters for an accessible-home search.
+Request: "{text}"
+Return JSON: needs: subset of {NEED_KEYS} (wheelchair -> no_stairs, step_free_entry, wide_doorways, walk_in_shower, smooth_flooring;
+elderly/aging in place -> no_stairs, first_floor_bedroom, grab_bars, walk_in_shower); max_price: number|null; min_beds: number|null;
+city: "Houston"|"Los Angeles"|null; rent: true|false|null; persona: one sentence about the user's situation; summary: short phrase."""
+    return ask(prompt)
+
+
+def analyze_selection(crop: bytes, full: bytes, room: str, instruction: str | None, size: dict | None,
+                      needs: list | None = None) -> dict:
+    dims = (f"Measured in the 3D scan: selection is {size['w']:.2f} m wide, {size['h']:.2f} m tall, {size['d']:.2f} m deep;"
+            f" vertical span {size.get('rise', 0):.2f} m.") if size else ""
+    prompt = f"""You are an accessibility specialist and remodeling estimator looking at a photo from a 3D tour of a real home.
+Image 1 = what the user selected; image 2 = the full view. Room: {room or 'unknown'}. {dims}
+User's accessibility needs: {needs or 'not stated'}.
+{'User request: ' + instruction if instruction else 'No request: propose the most useful accessibility change for what is selected.'}
+Anything can be removed, added or replaced (fixtures, furniture, flooring, doors, stairs equipment, lighting, counters...).
+Return JSON:
+{{"items":[{{"name":str,"observation":str concrete}}],
+ "changes":[{{"action":"remove"|"add"|"replace","title":str,"reason":str, {OPTIONS_SPEC}}}],
+ "summary": str (1-2 plain sentences)}}
+Reference installed-cost ranges: {json.dumps({v['label']: [v['low'], v['high']] for v in costs.MODS.values()})}
+At most 2 changes. Costs must be realistic for 2026. Never claim ADA compliance; say "more accessible"."""
+    imgs = [("image/jpeg", crop)] + ([("image/jpeg", full)] if full else [])
+    return _as_obj(ask(prompt, imgs), "changes")
+
+
+def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str) -> dict:
+    """First-pass agent: look at a few views of the home and pick the changes this user needs."""
+    prompt = f"""You are an accessibility agent touring a home for a buyer. Buyer: {persona or 'not described'}; needs: {needs}.
+You get {len(views)} photos from the home's 3D tour (image i is view i; rooms: {rooms}).
+Find the concrete EXISTING barriers for THIS buyer and the change that fixes each: bathtub or curbed shower -> curbless
+roll-in shower, toilet without support -> grab bars beside it, stairs -> stairlift, narrow door -> wider door, step at
+entry -> ramp, carpet -> hard floor, high counters/cabinets -> roll-under. Always fix an existing object you can see;
+never invent a new fixture in empty floor space. Ignore reflections in mirrors, glass and windows: only real objects. box_2d must tightly enclose that existing object (for a tub: the whole
+tub and its surround), large enough to show the result.
+Return JSON {{"findings":[{{"view": int, "box_2d":[ymin,xmin,ymax,xmax] on a 0-1000 scale tightly around the thing to change,
+  "item": str, "issue": str, "action":"remove"|"add"|"replace","title":str,"reason":str, {OPTIONS_SPEC}}}]}}
+At most one finding per view; skip views with nothing important. At most {min(4, len(views))} findings, most important first."""
+    return _as_obj(ask(prompt, [("image/jpeg", v) for v in views]), "findings")
+
+
 def chat(home: dict, edits: list, selection: dict | None, message: str, history: list) -> dict:
     ctx = {k: home.get(k) for k in ("address", "city", "price", "beds", "baths", "sqft", "stories", "year_built")}
     ctx["evidence"] = {k: v["status"] for k, v in home["evidence"].items()}
-    prompt = f"""You are Sandra's FrontDoor's home accessibility assistant, embedded in a live 3D tour.
+    prompt = f"""You are Sandra's FrontDoor's accessibility agent, embedded in a live 3D tour of this home.
 Home: {json.dumps(ctx)}
-Listing remarks: {home.get('remarks','')[:1200]}
-Edits already planned in the 3D model: {json.dumps(edits)}
-Current selection in the 3D view: {json.dumps(selection) if selection else 'none'}
-Conversation so far: {json.dumps(history[-8:])}
+Listing remarks: {home.get('remarks', '')[:1200]}
+Planned changes: {json.dumps(edits)}
+Current selection: {json.dumps(selection) if selection else 'none'}
+Conversation: {json.dumps(history[-8:])}
 User: {message}
-Answer concisely and concretely. Never claim legal ADA compliance; say "likely" and suggest verifying.
-If the user asks to change something they selected, include an action.
-Return JSON: {{"reply": str, "actions": [{{"action":"remove"|"add"|"replace","mod": one of {list(costs.MODS) + ['custom']},"title":str,"cost_low":int,"cost_high":int, (only for "custom") {PARTS_SPEC}}}]}}"""
-    return _as_obj(ask(prompt), "actions")
+Answer concisely and concretely (costs, trade-offs). Never claim legal ADA compliance; say "likely" and suggest verifying.
+Return JSON {{"reply": str}}"""
+    return _as_obj(ask(prompt), "reply")

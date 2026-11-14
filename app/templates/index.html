@@ -2,10 +2,9 @@
 {% block title %}Sandra's FrontDoor · Find a home that truly fits your life{% endblock %}
 {% block body %}
 <main class="max-w-[1500px] mx-auto px-4 md:px-8 py-6 md:py-8">
-  <section class="relative overflow-hidden rounded-[28px] bg-white shadow-card grid lg:grid-cols-[1.05fr_1fr] min-h-[440px]">
+  <section class="relative overflow-hidden rounded-[28px] bg-white shadow-card grid lg:grid-cols-[1.05fr_1fr] min-h-[340px]">
     <div class="relative z-10 p-7 md:p-12 flex flex-col justify-center">
-      <h1 class="text-4xl md:text-[56px] leading-[1.05] font-extrabold tracking-tight">Find a home that<br>truly fits your life</h1>
-      <p class="mt-4 text-lg text-slate-600 max-w-md">AI-powered home search with immersive 3D tours, accessibility insights, and the true cost of making a home work for you.</p>
+      <h1 class="text-3xl md:text-[44px] leading-[1.05] font-extrabold tracking-tight">What do you need in a home?</h1>
       <form id="search-form" class="mt-7 flex items-start gap-3 bg-white rounded-2xl border border-slate-200 shadow-card p-3 pl-4 max-w-2xl">
         <svg class="w-7 h-7 mt-1 shrink-0 text-brand-500" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.8 5.4L19 9l-5.2 1.6L12 16l-1.8-5.4L5 9l5.2-1.6zM19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9z"/></svg>
         <textarea id="q" rows="2" class="flex-1 resize-none outline-none text-[17px] leading-snug placeholder:text-slate-400 py-1"
@@ -20,10 +19,6 @@
     <div class="relative hidden lg:block">
       <img id="hero-img" alt="" class="absolute inset-0 w-full h-full object-cover opacity-0 transition-opacity duration-700">
       <div class="absolute inset-0 bg-gradient-to-r from-white via-white/30 to-transparent"></div>
-      <div class="absolute bottom-6 right-6 bg-white/95 rounded-2xl shadow-card p-4 w-72">
-        <div class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Why Sandra's FrontDoor</div>
-        <div class="mt-1.5 text-sm text-slate-700"><b>0 of 2,120</b> listings in our data fill in the official accessibility field. We read the listing, the 3D scan and the aerial view to find out for you.</div>
-      </div>
     </div>
   </section>
 
@@ -33,8 +28,8 @@
         <span class="w-11 h-11 rounded-2xl bg-brand-50 grid place-items-center text-brand-600">
           <svg class="w-6 h-6" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.8 5.4L19 9l-5.2 1.6L12 16l-1.8-5.4L5 9l5.2-1.6z"/></svg></span>
         <div>
-          <h2 class="text-2xl font-bold tracking-tight">Recommended for you</h2>
-          <p id="result-sub" class="text-slate-500 text-sm">Homes ranked by accessibility match and true cost (price + estimated modifications).</p>
+          <h2 class="text-2xl font-bold tracking-tight">Matches</h2>
+          <p id="result-sub" class="text-slate-500 text-sm"></p>
         </div>
       </div>
       <label class="text-sm text-slate-600">Sort by

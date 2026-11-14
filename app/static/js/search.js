@@ -79,8 +79,9 @@ async function run(q, filters) {
     body: JSON.stringify(filters ? { filters } : { q }) });
   const d = await res.json();
   state = { filters: d.filters, results: d.results, labels: d.need_labels };
+  try { if (d.filters.persona) sessionStorage.setItem('fd-persona', d.filters.persona); } catch {}
   $('#persona').textContent = d.filters.persona ? `Searching for: ${d.filters.summary || ''}` : '';
-  $('#result-sub').textContent = `${d.count.toLocaleString()} homes with 3D tours checked · ranked by accessibility match and true cost (price + estimated modifications).`;
+  $('#result-sub').textContent = `${d.count.toLocaleString()} homes with 3D tours · ranked by match, then true cost (price + changes)`;
   renderChips(); renderGrid();
 }
 

@@ -6,19 +6,21 @@ from dotenv import load_dotenv
 from flask import Flask
 
 ROOT = Path(__file__).resolve().parent.parent          # homematch/
-KIT = ROOT.parent                                      # costar-hackathon-kit/
 load_dotenv(ROOT / ".env")
+# The CoStar kit (data/, residential-listings.csv). Defaults to the folder above this repo.
+KIT = Path(os.environ.get("KIT_DIR", ROOT.parent))
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config.update(
         KIT_DIR=KIT,
-        CACHE_DIR=ROOT / "cache",
-        BUNDLE_DIR=ROOT / "sdk-test" / "node_modules" / "@matterport" / "webcomponent" / "built-bundle",
+        # On Cloud Run point CACHE_DIR at /tmp (or a mounted Cloud Storage bucket to keep renders).
+        CACHE_DIR=Path(os.environ.get("CACHE_DIR", ROOT / "cache")),
+        BUNDLE_DIR=Path(os.environ.get("BUNDLE_DIR", ROOT / "sdk-test" / "node_modules" / "@matterport" / "webcomponent" / "built-bundle")),
         MATTERPORT_SDK_KEY=os.environ.get("MATTERPORT_SDK_KEY", ""),
     )
-    app.config["CACHE_DIR"].mkdir(exist_ok=True)
+    app.config["CACHE_DIR"].mkdir(parents=True, exist_ok=True)
 
     from .services import listings
     listings.load(KIT)
