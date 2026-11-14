@@ -61,10 +61,8 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
     else:
         ImageDraw.Draw(mask).rectangle(sel, fill=255)
 
-    imgs = [("image/jpeg", _jpeg(ctx)), ("image/png", _png(mask.convert("RGB")))]
-    if ref_png:
-        imgs.append(("image/png", ref_png))
-    out = Image.open(io.BytesIO(ai.edit_image(imgs, PROMPT.format(task=task, ref=REF_NOTE if ref_png else "")))).convert("RGB")
+    raw, provider = ai.edit_image(_jpeg(ctx), mask, PROMPT.format(task=task, ref=REF_NOTE if ref_png else ""), ref_png)
+    out = Image.open(io.BytesIO(raw)).convert("RGB")
     out = out.resize((cw, ch), Image.LANCZOS)
 
     # color-match the generated image to the original using the area outside the mask (should be unchanged)
@@ -94,7 +92,7 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
     # a tight crop of the edited item, used as the reference so other viewpoints render the same product
     ref = out.crop((max(0, int(sel[0])), max(0, int(sel[1])), min(cw, int(sel[2])), min(ch, int(sel[3]))))
     (out_dir / f"{pid}_ref.png").write_bytes(_png(ref))
-    meta = {"id": pid, "rect": [(cx0 + bbox[0]) / W, (cy0 + bbox[1]) / H, (cx0 + bbox[2]) / W, (cy0 + bbox[3]) / H],
+    meta = {"provider": provider, "id": pid, "rect": [(cx0 + bbox[0]) / W, (cy0 + bbox[1]) / H, (cx0 + bbox[2]) / W, (cy0 + bbox[3]) / H],
             "size": [W, H]}
     (out_dir / f"{pid}.json").write_text(json.dumps(meta))
     return meta

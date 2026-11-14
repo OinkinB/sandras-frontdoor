@@ -31,6 +31,11 @@ const selFor = new Map();        // editId -> selection (frozen frame, kept in m
 const pending = new Set();
 let chatHistory = [];
 let agentBusy = false, agentAbort = false;
+const keyOf = (room, title) => `${room}|${String(title).toLowerCase()}`;
+const declined = new Set((() => { try { return JSON.parse(localStorage.getItem(`frontdoor-declined-${window.HOME.id}`) || '[]'); } catch { return []; } })());
+const saveDeclined = () => { try { localStorage.setItem(`frontdoor-declined-${H.id}`, JSON.stringify([...declined])); } catch {} };
+// Everything the agent should know about what's already been done in this home
+const stateForAgent = () => edits.filter((x) => x.status !== 'failed').map((x) => ({ room: x.room, change: x.title, replaced: x.item, product: x.option?.name, shown: x.on !== false, status: x.status }));
 
 /* ================= boot ================= */
 const iframe = $('#showcase');
@@ -98,13 +103,45 @@ const snapPose = (p = poseCache) => ({ sweep: p.sweep, position: { ...p.position
 async function hitAt(x, y) {
   try { const d = await sdk.Renderer.getWorldPositionData({ x, y }); return d && d.position ? d.position : null; } catch { return null; }
 }
+/* Walk to a scan point through its neighbors, like stepping through the house, instead of jumping. */
+async function walkTo(target) {
+  if (!poseCache || poseCache.sweep === target) return;
+  const byId = Object.fromEntries(sweepList.map((s) => [s.id, s]));
+  const prev = { [poseCache.sweep]: null }, q = [poseCache.sweep];
+  while (q.length && !(target in prev)) { const c = q.shift(); for (const n of byId[c]?.neighbors || []) if (!(n in prev) && byId[n]) { prev[n] = c; q.push(n); } }
+  const path = [];
+  if (target in prev) for (let c = target; c && c !== poseCache.sweep; c = prev[c]) path.unshift(c);
+  else path.push(target);
+  for (const id of path.slice(0, 12)) await soon(sdk.Sweep.moveTo(id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 520 }), 2500);
+  if (path.length > 12) await soon(sdk.Sweep.moveTo(target, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }), 3000);
+  await sleep(250);
+}
+/* Spotlight an exact item on screen (loc.rect is normalized for the view at loc.rot). */
+function spotlight(loc) {
+  clearSpot();
+  const W = overlay.clientWidth, Hh = overlay.clientHeight, [x0, y0, x1, y1] = loc.rect;
+  const el = document.createElement('div'); el.className = 'spot'; el.id = 'spot';
+  Object.assign(el.style, { left: x0 * W + 'px', top: y0 * Hh + 'px', width: (x1 - x0) * W + 'px', height: (y1 - y0) * Hh + 'px' });
+  if (loc.label) el.innerHTML = `<span class="sel-label">${esc(loc.label)}</span>`;
+  overlay.appendChild(el); spotFor = loc;
+}
+let spotFor = null;
+function clearSpot() { $('#spot')?.remove(); spotFor = null; }
+async function goTo(loc) {
+  stopAgentSoft(); switchView('tour'); closeDrawers(); setMode('walk');
+  await walkTo(loc.sweep); await lookAt(loc.rot, 120); await sleep(150);
+  spotlight(loc);
+}
+function stopAgentSoft() { /* navigating from chat while the tour waits for an answer is fine */ }
 // Camera.setRotation is sometimes ignored by the SDK; rotate (yaw -h, pitch +v) and verify.
-async function lookAt(rot) {
+async function lookAt(rot, speed = 10000) {     // speed in degrees/second; ~90 looks like turning your head
   const off = () => { const c = poseCache.rotation; return { dy: ((rot.y - c.y + 540) % 360) - 180, dx: rot.x - c.x }; };
   for (let k = 0; k < 4; k++) {
     const { dy, dx } = off();
     if (Math.abs(dy) < 0.6 && Math.abs(dx) < 0.6) return true;
-    await soon(sdk.Camera.rotate(-dy, dx, { speed: 10000 }), 2500); await sleep(250);
+    const ms = Math.min(4000, (Math.max(Math.abs(dy), Math.abs(dx)) / speed) * 1000);
+    await soon(sdk.Camera.rotate(-dy, dx, { speed }), ms + 2500); await sleep(k ? 250 : Math.max(250, ms * 0.15));
+    speed = Math.max(speed, 300);   // small corrections can be quick
   }
   const { dy, dx } = off(); return Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5;
 }
@@ -195,6 +232,7 @@ function onPose(p) {
     refreshVisibility();
   }
   overlay.querySelectorAll('.sel-box').forEach((e) => e.remove());   // 2D outlines only make sense for the view they were drawn in
+  if (spotFor && (p.sweep !== spotFor.sweep || Math.abs(((p.rotation.y - spotFor.rot.y + 540) % 360) - 180) + Math.abs(p.rotation.x - spotFor.rot.x) > 2)) clearSpot();
   if (mode === 'select') hideMenu();
   clearTimeout(settleTimer);
   settleTimer = setTimeout(renderMissingViews, 1100);
@@ -247,7 +285,7 @@ async function renderPatch(e, r, pose, image, poly, fix) {
     body: JSON.stringify({ image, rect: [r.x0 / W, r.y0 / Hh, r.x1 / W, r.y1 / Hh], task: taskText(e), ref: e.ref || null, fix: fix || null,
       poly: poly ? poly.map(([x, y]) => [x / W, y / Hh]) : null }) }).then((x) => x.json());
   if (meta.error) throw new Error(meta.error);
-  const p = { sweep: pose.sweep, rid: meta.id, corners: patchCorners(meta.rect, pose), rot: { ...pose.rotation } };
+  const p = { sweep: pose.sweep, rid: meta.id, corners: patchCorners(meta.rect, pose), rot: { ...pose.rotation }, rectN: meta.rect };
   e.patches.push(p); save();
   await mountPatch(e, p);
   return meta;
@@ -319,9 +357,9 @@ function similarEdit(sel, instruction) {
   return edits.find((e) => e.status !== 'failed' && e.on !== false && e.roomId && e.roomId === sel.roomId &&
     ((e.world && sel.world && !sel.whole && dist(e.world.center, sel.world.center) < 1.2) || [...words(e.title + ' ' + (e.instruction || ''))].filter((w) => want.has(w)).length >= 2));
 }
-function ask(html, buttons) {   // a question in the chat with button answers
+function ask(html, buttons, loc = null) {   // a question in the chat with button answers
   return new Promise((res) => {
-    const el = bubble(`${html}<div class="mt-2 flex flex-wrap gap-2">${buttons.map(([k, l], i) => `<button data-k="${k}" class="text-sm font-semibold rounded-lg px-3 py-1.5 ${i ? 'border hover:bg-slate-50' : 'bg-brand-600 text-white hover:bg-brand-700'}">${l}</button>`).join('')}</div>`);
+    const el = bubble(`${html}<div class="mt-2 flex flex-wrap gap-2">${buttons.map(([k, l], i) => `<button data-k="${k}" class="text-sm font-semibold rounded-lg px-3 py-1.5 ${i ? 'border hover:bg-slate-50' : 'bg-brand-600 text-white hover:bg-brand-700'}">${l}</button>`).join('')}</div>`, 'ai', loc);
     el.querySelectorAll('[data-k]').forEach((b) => b.onclick = () => { el.querySelectorAll('button').forEach((x) => x.disabled = true); b.classList.add('ring-2', 'ring-brand-300'); res(b.dataset.k); });
   });
 }
@@ -342,7 +380,7 @@ async function command(sel, instruction, label, finding = null) {
   if (dup) {
     const k = await ask(`You already have <b>${esc(dup.title)}</b> here${dup.option ? ` (${esc(dup.option.name)}, ${money(dup.cost)})` : ''}. What would you like?`,
       [['replace', 'Replace it with this'], ['keep', 'Keep what I have'], ['both', 'Add both']]);
-    if (k === 'keep') { flyTo(dup); return; }
+    if (k === 'keep') { flyTo(dup); return dup; }
     if (k === 'replace') removeEdit(dup.id, true);
   }
   const e = newEdit(sel, { title: label || instruction, instruction });
@@ -352,7 +390,7 @@ async function command(sel, instruction, label, finding = null) {
       const image = await annotate(sel);
       const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ views: [{ image, room: sel.roomLabel }], needs: NEEDS, persona: PERSONA, instruction, outlined: !sel.whole,
-          existing: edits.filter((x) => x !== e && x.status !== 'failed').map((x) => `${x.room}: ${x.title}`) }) }).then((r) => r.json());
+          existing: stateForAgent().filter((x) => x.change !== e.title), declined: [...declined] }) }).then((r) => r.json());
       if (plan.error) throw new Error(plan.error);
       f = (plan.findings || [])[0];
       if (!f) throw new Error("I couldn't find what you meant in that view. Try circling it again.");
@@ -371,6 +409,7 @@ async function command(sel, instruction, label, finding = null) {
   } catch (err) {
     setStatus(e, 'failed', { error: err.message });
   }
+  return e;
 }
 async function renderAndReview(e, sel) {
   const r = { x0: sel.rect.x, y0: sel.rect.y, x1: sel.rect.x + sel.rect.w, y1: sel.rect.y + sel.rect.h };
@@ -390,6 +429,8 @@ async function renderAndReview(e, sel) {
   }
   setStatus(e, 'ready');
   refreshVisibility();
+  const p = e.patches[0];
+  if (p && !agentBusy) say(`✅ <b>${esc(e.title)}</b> is ready${e.option ? ` · ${esc(e.option.name)} · ${money(e.cost)}` : ''}.`, { sweep: p.sweep, rot: p.rot, rect: p.rectN, label: e.title });
   if (e.review && e.review.ok === false) bubble(`<div class="text-sm">I rendered <b>${esc(e.title)}</b>, but the quality check still flagged: ${esc((e.review.issues || []).join('; '))}. Swap the product in <b>Changes</b> to try another look.</div>`);
 }
 
@@ -413,7 +454,6 @@ function setTool(t) {
 document.querySelectorAll('[data-tool-pick]').forEach((b) => b.onclick = () => setTool(b.dataset.toolPick));
 $('#mode-walk').onclick = () => setMode('walk');
 $('#mode-select').onclick = () => setMode('select');
-$('#qa-change').onclick = () => setMode('select');
 let peek = false;
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
@@ -528,13 +568,23 @@ function showMenu(sel) {
 }
 
 /* ================= chat ================= */
-function bubble(html, who = 'ai') {
+function bubble(html, who = 'ai', loc = null) {
   const el = document.createElement('div');
-  el.className = who === 'user' ? 'flex justify-end' : 'flex';
-  el.innerHTML = who === 'user' ? `<div class="max-w-[85%] bg-brand-100 text-brand-900 rounded-2xl rounded-br-md px-4 py-2.5">${html}</div>`
-    : `<div class="w-full bg-slate-50 border border-slate-100 rounded-2xl rounded-bl-md px-4 py-3 text-[15px]">${html}</div>`;
-  $('#chat').appendChild(el); $('#chat').scrollTop = 1e9; return el;
+  el.className = 'msg-in ' + (who === 'user' ? 'flex justify-end' : 'flex');
+  el.innerHTML = who === 'user' ? `<div class="max-w-[85%] bg-brand-100 text-brand-900 rounded-2xl rounded-br-md px-3 py-2 text-sm">${html}</div>`
+    : `<div class="w-full bg-white border border-slate-100 rounded-xl px-3 py-2 text-sm ${loc ? 'alert' : ''}">${loc ? '<div class="text-[11px] font-semibold text-brand-700 mb-0.5">📍 Click to see it</div>' : ''}${html}</div>`;
+  if (loc) {
+    const card = el.firstElementChild;
+    card.onclick = (ev) => { if (ev.target.closest('button')) return; card.classList.add('seen'); card.firstElementChild.textContent = '📍 Seen. Click to go back'; goTo(loc); };
+  }
+  const chat = $('#chat'), atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
+  chat.appendChild(el);
+  if (atBottom || who === 'user') chat.scrollTop = 1e9;   // like a live chat: follow new messages unless you scrolled up
+  if (document.body.classList.contains('guide-min') && who !== 'user') { unread++; $('#guide-new').textContent = unread; }
+  return el;
 }
+let unread = 0;
+const say = (html, loc) => bubble(html, 'ai', loc);
 const thinking = (t = 'Thinking') => bubble(`<span class="dots text-slate-500">${t}<span>.</span><span>.</span><span>.</span></span>`);
 const CHANGE_RE = /(make|turn|change|replace|remove|add|convert|swap|put|install|get rid|widen|lower|raise|build|design|walk-?in|ramp|grab bar|stairlift|seat|door|shower|accessible)/i;
 $('#chat-form').addEventListener('submit', async (ev) => {
@@ -569,53 +619,82 @@ async function startAgent() {
   finally { agentBusy = false; renderMissingViews(); }
 }
 $('#agent-run').onclick = startAgent;
-$('#qa-guided').onclick = startAgent;
 async function guidedTour() {
   for (let i = 0; i < 50 && !poseCache; i++) await sleep(100);
   const rooms = agentRooms();
-  bubble(`<div class="font-semibold">Let's walk through it together</div><div class="text-sm text-slate-600 mt-0.5">I'll take you to ${rooms.map((r) => esc(r.label)).join(', ')}.
-    In each room I'll point out what gets in the way${NEEDS.length ? ' for your needs' : ''} and show the fix. You choose what to keep; I'll skip extras that don't help.
-    ${BUDGET ? `Your budget is ${money(BUDGET)}.` : ''}</div>`);
+  say(`<b>Let's walk through it together.</b> I'll take you to ${rooms.map((r) => esc(r.label)).join(', ')}, point out what gets in the way${NEEDS.length ? ' for your needs' : ''}, and show each fix in place. You decide what to keep.${BUDGET ? ` Budget: ${money(BUDGET)}.` : ''}`);
   let accepted = 0;
   for (const room of rooms) {
     if (agentAbort) break;
     const step = thinking(`Walking to ${room.label}`);
-    await soon(sdk.Sweep.moveTo(centerSweep(room).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }));
-    await sleep(900);
+    await walkTo(centerSweep(room).id);
+    await sleep(500);
+    // look around smoothly while capturing what we see
     const views = [];
+    const start = { ...poseCache.rotation };
     for (let k = 0; k < 4 && !agentAbort; k++) {
-      await lookAt({ x: -15, y: k * 90 }); await sleep(400);
-      views.push({ image: await soon(sdk.Renderer.takeScreenShot({ width: 768, height: 576 }, { mattertags: false, sweeps: false }), 8000), room: room.label, rot: { x: -15, y: k * 90 } });
+      if (k) await lookAt({ x: -15, y: start.y + k * 90 }, 110); else await lookAt({ x: -15, y: start.y }, 110);
+      // same aspect as the tour on screen, so the agent's box coordinates map straight onto the view
+      views.push({ image: await soon(sdk.Renderer.takeScreenShot({ width: 960, height: Math.round(960 * iframe.clientHeight / iframe.clientWidth) }, { mattertags: false, sweeps: false }), 8000), room: room.label, rot: { ...poseCache.rotation } });
     }
-    if (agentAbort) { step.remove(); break; }
-    const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ views, needs: NEEDS, persona: PERSONA, existing: edits.map((x) => `${x.room}: ${x.title}`) }) }).then((r) => r.json()).catch(() => ({}));
     step.remove();
     if (agentAbort) break;
-    const f = (plan.findings || []).find((x) => x.fits_needs !== false) || null;
-    if (!f) { bubble(`<b>${esc(room.label)}</b>: nothing here gets in your way. 👍`); continue; }
-    await lookAt(views[f.view]?.rot || views[0].rot); await sleep(500);
-    const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d || [250, 250, 750, 750];
-    const rect = { x: b[1] / 1000 * W, y: b[0] / 1000 * Hh, w: (b[3] - b[1]) / 1000 * W, h: (b[2] - b[0]) / 1000 * Hh };
-    const outline = screenOutline(rect, null);
+    const step2 = thinking(`Checking ${room.label}`);
+    const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ views, needs: NEEDS, persona: PERSONA, existing: stateForAgent(), declined: [...declined] }) }).then((r) => r.json()).catch(() => ({}));
+    step2.remove();
+    if (agentAbort) break;
+    const f = (plan.findings || []).find((x) => x.fits_needs !== false && !declined.has(keyOf(room.label, x.title))) || null;
+    if (!f) { say(`<b>${esc(room.label)}</b>: nothing here gets in your way. 👍`); continue; }
+    // Turn to it, then re-locate it in exactly what's on screen (the model's view numbering isn't reliable).
+    const order = [f.view, f.view - 1, ...views.keys()].filter((v, i, arr) => v >= 0 && v < views.length && arr.indexOf(v) === i);
+    let b = null;
+    for (const v of order) {
+      await lookAt(views[v].rot, 90); await sleep(250);
+      const shot = await soon(sdk.Renderer.takeScreenShot({ width: 960, height: Math.round(960 * iframe.clientHeight / iframe.clientWidth) }, { mattertags: false, sweeps: false }), 8000);
+      const re = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ views: [{ image: shot, room: room.label }], needs: NEEDS, instruction: `Locate: ${f.item} (${f.title}). Only return it if it is clearly visible in this photo.` }) }).then((r) => r.json()).catch(() => ({}));
+      const g = (re.findings || [])[0];
+      if (g?.box_2d) { b = g.box_2d; break; }   // the locate prompt names the exact item, so any box it returns is it
+      if (agentAbort) break;
+    }
+    if (agentAbort) break;
+    if (!b) { say(`<b>${esc(room.label)}</b>: I noticed ${esc(f.item)} but couldn't line it up on screen. You can circle it yourself with <b>✎ Change something</b>.`); continue; }
+    const loc = { sweep: poseCache.sweep, rot: { ...poseCache.rotation }, rect: [b[1] / 1000, b[0] / 1000, b[3] / 1000, b[2] / 1000], label: f.item };
+    spotlight(loc);
     const opt = (f.options || [])[Math.min(1, (f.options || []).length - 1)];
-    const k = await ask(`<div class="text-xs font-semibold text-slate-500 uppercase">${esc(room.label)}</div>
+    const k = await ask(`<div class="text-[11px] font-semibold text-slate-500 uppercase">${esc(room.label)}</div>
       <div class="font-semibold">${esc(f.item)}: ${esc(f.issue)}</div>
-      <div class="text-sm text-slate-600 mt-0.5">Suggested: <b>${esc(f.title)}</b>${opt ? `, e.g. ${esc(opt.name)} for about ${money(opt.total)} (item ${money(opt.material)} + labor ${money(opt.labor)})` : ''}.</div>
+      <div class="text-sm text-slate-600 mt-0.5">Fix: <b>${esc(f.title)}</b>${opt ? `, e.g. ${esc(opt.name)}, about ${money(opt.total)} (item ${money(opt.material)} + labor ${money(opt.labor)})` : ''}.</div>
       ${f.advice ? `<div class="text-sm text-slate-500 mt-0.5">${esc(f.advice)}</div>` : ''}`,
-      [['yes', 'Show me this fix'], ['skip', 'Skip'], ['stop', 'End tour']]);
-    outline.remove();
-    if (k === 'stop' || agentAbort) { agentAbort = true; break; }
-    if (k === 'skip') continue;
+      [['yes', 'Show me this fix'], ['skip', 'Skip'], ['stop', 'End tour']], loc);
+    if (k === 'stop' || agentAbort) { agentAbort = true; clearSpot(); break; }
+    if (k === 'skip') { declined.add(keyOf(room.label, f.title)); saveDeclined(); clearSpot(); continue; }
+    // stay in this room until the fix is ready, then show it right here
+    await walkTo(loc.sweep); await lookAt(loc.rot, 90); await sleep(300);
+    const W = iframe.clientWidth, Hh = iframe.clientHeight;
+    const rect = { x: loc.rect[0] * W, y: loc.rect[1] * Hh, w: (loc.rect[2] - loc.rect[0]) * W, h: (loc.rect[3] - loc.rect[1]) * Hh };
+    clearSpot();
     const sel = await makeSelection(rect, null, { silent: true, item: f.item });
     accepted++;
-    command(sel, f.title, f.title, { ...f, box_2d: null });     // renders in the background while we keep walking
-    bubble(`<div class="text-sm">On it. I'll show you <b>${esc(f.title)}</b> as soon as it's ready; let's keep going.</div>`);
+    say(`Working on <b>${esc(f.title)}</b>. I'll stay here and show you when it's ready (about a minute).`);
+    const e = await command(sel, f.title, f.title, { ...f, box_2d: null });
+    if (agentAbort) break;
+    if (e?.status === 'ready') {
+      await walkTo(loc.sweep); await lookAt(loc.rot, 90); setView('after');
+      const k2 = await ask(`<b>Here it is: ${esc(e.title)}</b>${e.option ? ` (${esc(e.option.name)}, ${money(e.cost)})` : ''}. Hold <b>B</b> to compare with today.`,
+        [['next', 'Keep it, next room'], ['undo', 'Undo it'], ['stop', 'End tour']]);
+      if (k2 === 'undo') { removeEdit(e.id); accepted--; }
+      if (k2 === 'stop') { agentAbort = true; break; }
+    } else if (e) {
+      const k2 = await ask(`I couldn't finish <b>${esc(e.title)}</b> (${esc(e.error || 'unknown error')}).`, [['next', 'Next room'], ['stop', 'End tour']]);
+      if (k2 === 'stop') { agentAbort = true; break; }
+    }
   }
-  const total = edits.filter((x) => x.on !== false && x.status !== 'failed').reduce((s, x) => s + (x.cost || 0), 0);
-  bubble(agentAbort ? 'Tour ended. The home is yours to explore.' :
-    `<div class="font-semibold">That's the tour.</div><div class="text-sm text-slate-600">${accepted ? `${accepted} change${accepted > 1 ? 's' : ''} on the way (${money(total)} so far${BUDGET ? `; ${H.price + total <= BUDGET ? 'within' : 'over'} your ${money(BUDGET)} budget` : ''}).` : 'No changes needed.'}
-     Cards on the tour tell you when each is ready. Circle anything else you'd like to change.</div>`);
+  clearSpot();
+  const total = edits.filter((x) => x.on !== false && x.status === 'ready').reduce((s, x) => s + (x.cost || 0), 0);
+  say(agentAbort ? 'Tour ended. The home is yours to explore.' :
+    `<b>That's the tour.</b> ${accepted ? `${accepted} change${accepted > 1 ? 's' : ''}, ${money(total)} in total${BUDGET ? `; total cost ${money(H.price + total)} is ${H.price + total <= BUDGET ? 'within' : 'over'} your ${money(BUDGET)} budget` : ''}.` : 'No changes needed.'} Circle anything else you'd like to change.`);
 }
 
 /* ================= changes drawer, undo, compare ================= */
@@ -721,11 +800,7 @@ function renderAccess(d) {
     + (d.scan?.findings || []).map((f) => `<li class="border border-brand-100 bg-brand-50/50 rounded-xl p-3 text-sm"><b>3D scan:</b> ${esc(f.evidence.replace('3D scan: ', ''))}</li>`).join('');
   const rooms = d.scan?.rooms || [];
   $('#rooms').innerHTML = rooms.map((r) => `<div class="flex justify-between border-t border-slate-100 py-1"><span>${esc(r.type)}</span><span class="text-slate-500">${r.width_ft ? `${r.width_ft.toFixed(1)} × ${(r.depth_ft || 0).toFixed(1)} ft` : ''}</span></div>`).join('');
-  $('#score').textContent = d.match; $('#score-bar').style.width = d.match + '%';
-  const tag = d.match >= 85 ? ['Highly accessible', 'bg-emerald-50 text-emerald-700'] : d.match >= 65 ? ['Accessible with changes', 'bg-sky-50 text-sky-700'] : ['Needs work', 'bg-amber-50 text-amber-700'];
-  $('#score-tag').textContent = tag[0]; $('#score-tag').className = 'text-xs font-semibold rounded-full px-2 py-0.5 ' + tag[1];
-  const yes = ev.filter(([k, v]) => v.status === 'yes' && wanted.includes(k)).map(([, v]) => v.label);
-  $('#features').innerHTML = (yes.length ? yes.slice(0, 3) : ['Nothing confirmed yet']).map((t) => `<li>${yes.length ? '✓ ' : ''}${esc(t)}</li>`).join('');
+  $('#score').textContent = d.match;
 }
 async function loadOutside() {
   const a = await fetch(`/api/home/${H.id}/aerial`).then((r) => r.json());
@@ -775,3 +850,6 @@ window.FD_CONTEXT = async () => ({
   edits: edits.map(({ options, crop, ...e }) => e),
   chat: [...document.querySelectorAll('#chat > div')].slice(-30).map((d) => d.innerText.slice(0, 600)),
 });
+
+$('#guide-min').onclick = () => { document.body.classList.add('guide-min'); $('#guide').classList.add('hidden'); $('#guide-open').classList.remove('hidden'); unread = 0; $('#guide-new').textContent = ''; };
+$('#guide-open').onclick = () => { document.body.classList.remove('guide-min'); $('#guide').classList.remove('hidden'); $('#guide-open').classList.add('hidden'); $('#chat').scrollTop = 1e9; };

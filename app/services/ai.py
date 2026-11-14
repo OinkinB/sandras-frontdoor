@@ -97,20 +97,74 @@ def ask(prompt, images=(), want_json=True):
     raise RuntimeError("; ".join(errors) or "no AI provider configured")
 
 
-def edit_image(images: list[tuple[str, bytes]], prompt: str) -> bytes:
-    """Photoreal image edit with Gemini's image model. Returns image bytes."""
+import io as _io
+import threading as _threading
+
+_image_lock = _threading.Semaphore(int(os.environ.get("IMAGE_CONCURRENCY", "1")))   # one image job at a time avoids 429 bursts
+IMAGE_PROVIDER = os.environ.get("IMAGE_PROVIDER", "auto")          # auto | gemini | openai
+OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
+
+
+def _gemini_edit(images, prompt):
     parts = [_img_part(m, b) for m, b in images] + [{"text": prompt}]
     last = None
-    for attempt in range(3):          # image models occasionally return an empty candidate; retry
+    for attempt in range(3):
         try:
             out = _gemini_raw(IMAGE_MODEL, parts, {"responseModalities": ["IMAGE"], "temperature": 0.4 + 0.15 * attempt}, timeout=240)
             for p in out:
                 if p.get("inlineData", {}).get("data"):
                     return base64.b64decode(p["inlineData"]["data"])
-            last = RuntimeError("image model returned text only")
+            last = RuntimeError("returned text only")
+        except requests.HTTPError as e:
+            last = e
+            if e.response is not None and e.response.status_code == 429:   # rate limited: back off, then retry
+                time.sleep(4 * (attempt + 1) ** 2)
+                continue
         except Exception as e:
             last = e
-    raise RuntimeError(f"image model failed: {last}")
+    raise RuntimeError(f"Gemini image failed: {last}")
+
+
+def _openai_edit(ctx_jpeg, mask_l, prompt, ref_png=None):
+    """OpenAI image edit with a real mask (transparent = edit here)."""
+    from PIL import Image
+    ctx = Image.open(_io.BytesIO(ctx_jpeg)).convert("RGB")
+    w, h = ctx.size
+    size = (1536, 1024) if w / h > 1.25 else (1024, 1536) if h / w > 1.25 else (1024, 1024)
+    img = ctx.resize(size, Image.LANCZOS)
+    alpha = mask_l.resize(size).point(lambda v: 0 if v > 127 else 255)
+    mask = Image.new("RGBA", size, (0, 0, 0, 255)); mask.putalpha(alpha)
+    def png(im):
+        b = _io.BytesIO(); im.save(b, "PNG"); return b.getvalue()
+    files = [("image[]", ("scene.png", png(img), "image/png"))]
+    if ref_png:
+        files.append(("image[]", ("reference.png", ref_png, "image/png")))
+    files.append(("mask", ("mask.png", png(mask), "image/png")))
+    r = requests.post("https://api.openai.com/v1/images/edits", timeout=300, files=files,
+                      headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+                      data={"model": OPENAI_IMAGE_MODEL, "prompt": prompt, "size": f"{size[0]}x{size[1]}", "quality": "medium", "n": "1"})
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI image failed: {r.status_code} {r.text[:200]}")
+    return base64.b64decode(r.json()["data"][0]["b64_json"])
+
+
+def edit_image(ctx_jpeg: bytes, mask_l, prompt: str, ref_png: bytes | None = None) -> tuple[bytes, str]:
+    """Photoreal masked edit. Gemini first (with backoff on rate limits), OpenAI as fallback. Returns (image, provider)."""
+    order = {"gemini": ["gemini"], "openai": ["openai"]}.get(IMAGE_PROVIDER, ["gemini", "openai"])
+    errors = []
+    with _image_lock:
+        for prov in order:
+            try:
+                if prov == "gemini" and os.environ.get("GCP_PROJECT"):
+                    def png(im):
+                        b = _io.BytesIO(); im.convert("RGB").save(b, "PNG"); return b.getvalue()
+                    imgs = [("image/jpeg", ctx_jpeg), ("image/png", png(mask_l))] + ([("image/png", ref_png)] if ref_png else [])
+                    return _gemini_edit(imgs, prompt), "gemini"
+                if prov == "openai" and os.environ.get("OPENAI_API_KEY"):
+                    return _openai_edit(ctx_jpeg, mask_l, prompt, ref_png), "openai"
+            except Exception as e:
+                errors.append(str(e)[:200])
+    raise RuntimeError("; ".join(errors) or "no image provider configured")
 
 
 def _as_obj(res, list_key):
@@ -163,7 +217,7 @@ At most 2 changes. Costs must be realistic for 2026. Never claim ADA compliance;
 
 
 def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, instruction: str = "",
-               outlined: bool = False, existing: list | None = None) -> dict:
+               outlined: bool = False, existing: list | None = None, declined: list | None = None) -> dict:
     """Agent: find what to change. With an instruction it targets the object the user means (the magenta outline,
     if present, only marks roughly where they pointed)."""
     target = ""
@@ -176,7 +230,12 @@ def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, 
     prompt = f"""You are an accessibility agent touring a home for a buyer. Buyer: {persona or 'not described'}; needs: {needs}.
 You get {len(views)} photos from the home's 3D tour (image i is view i; rooms: {rooms}).
 {target}
-Changes already planned in this home (do not repeat them): {json.dumps(existing or [])}
+WHAT HAS ALREADY BEEN DONE IN THIS HOME (the photos may still show the original, but treat these as done):
+{json.dumps(existing or [])}
+Suggestions the buyer already declined (never suggest again): {json.dumps(declined or [])}
+Be context aware: never propose something already done or declined. Also judge redundancy across the home: e.g. if one
+bathroom already has (or is planned to get) a roll-in shower, a second bathroom's tub is a lower priority; then set
+fits_needs false or say in "advice" that it's optional and why. Prefer the barriers that matter most for daily life.
 Find the concrete EXISTING barriers for THIS buyer and the change that fixes each: bathtub or curbed shower -> curbless
 roll-in shower, toilet without support -> grab bars beside it, stairs -> stairlift, narrow door -> wider door, step at
 entry -> ramp, carpet -> hard floor, high counters/cabinets -> roll-under. Always fix an existing object you can see;

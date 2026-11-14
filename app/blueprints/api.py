@@ -203,7 +203,7 @@ def agent_plan(home_id):
     views = [_b64img(v["image"]) for v in b.get("views") or []][:8]
     try:
         res = ai.agent_plan(views, [v.get("room", "") for v in b.get("views") or []], b.get("needs") or [], b.get("persona", ""),
-                           b.get("instruction", ""), bool(b.get("outlined")), b.get("existing") or [])
+                           b.get("instruction", ""), bool(b.get("outlined")), b.get("existing") or [], b.get("declined") or [])
     except Exception as e:
         current_app.logger.error("AI error on %s: %s", request.path, e)
         return jsonify({"error": f"AI unavailable: {e}"[:300]}), 502
