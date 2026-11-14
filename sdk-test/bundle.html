@@ -1,0 +1,26 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Bundle test</title>
+<style>body{margin:0;font:14px sans-serif}iframe{width:100vw;height:80vh;border:0}#log{padding:8px;white-space:pre}</style></head>
+<body><iframe id="f"></iframe><div id="log">loading bundle...</div>
+<script src="config.js"></script>
+<script>
+const log=(...a)=>{document.getElementById('log').textContent+='\n'+a.join(' ');console.log(...a)};
+const f=document.getElementById('f');
+f.src=`node_modules/@matterport/webcomponent/built-bundle/showcase.html?m=1w2WjZPFb3H&play=1&qs=1&applicationKey=${window.MP_SDK_KEY}`;
+f.addEventListener('load',async()=>{
+  try{
+    const sdk=await f.contentWindow.MP_SDK.connect(f.contentWindow);
+    window.sdk=sdk; log('BUNDLE CONNECTED; Scene API:', !!sdk.Scene);
+    await sdk.App.state.waitUntil(s=>s.phase===sdk.App.Phase.PLAYING);
+    function Box(){this.onInit=function(){const T=this.context.three;
+      const m=new T.Mesh(new T.BoxGeometry(0.8,0.8,0.8),new T.MeshBasicMaterial({color:0x00cc66,transparent:true,opacity:0.55}));
+      this.outputs.objectRoot=m;this.outputs.collider=m;}}
+    await sdk.Scene.register('hm.box',()=>new Box());
+    const sweeps=[];await new Promise(r=>{const sub=sdk.Sweep.data.subscribe({onCollectionUpdated:c=>{sweeps.push(...Object.values(c));sub.cancel();r();}})});
+    const s=sweeps[0]; log('sweeps',sweeps.length,'first at',JSON.stringify(s.position));
+    const [obj]=await sdk.Scene.createObjects(1); const node=obj.addNode();
+    node.addComponent('hm.box'); node.position.set(s.position.x+1.2,s.position.y-0.6,s.position.z); node.start();
+    await sdk.Sweep.moveTo(s.id,{transition:sdk.Sweep.Transition.INSTANT});
+    log('GREEN BOX PLACED near first sweep');
+  }catch(e){log('ERROR',e&&e.message||e)}
+});
+</script></body></html>

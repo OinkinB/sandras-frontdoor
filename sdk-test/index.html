@@ -1,0 +1,20 @@
+<!doctype html><html><head><meta charset="utf-8"><title>SDK test</title>
+<style>body{margin:0;font:14px sans-serif}iframe{width:100vw;height:80vh;border:0}#log{padding:8px;white-space:pre}</style></head>
+<body><iframe id="f"></iframe><div id="log">loading...</div>
+<script src="config.js"></script>
+<script src="https://static.matterport.com/showcase-sdk/latest.js"></script>
+<script>
+const log=(...a)=>{document.getElementById('log').textContent+='\n'+a.join(' ');console.log(...a)};
+const f=document.getElementById('f');
+f.src=`https://my.matterport.com/show?m=1w2WjZPFb3H&play=1&qs=1&applicationKey=${window.MP_SDK_KEY}`;
+f.addEventListener('load',async()=>{
+  try{
+    const sdk=await window.MP_SDK.connect(f,window.MP_SDK_KEY,'');
+    log('SDK CONNECTED');
+    window.sdk=sdk;
+    sdk.Sweep.data.subscribe({onCollectionUpdated:c=>log('sweeps:',Object.keys(c).length)});
+    sdk.Pointer.intersection.subscribe(i=>{window.lastHit=i});
+    log('Scene API available:', !!(sdk.Scene && sdk.Scene.createObjects));
+  }catch(e){log('SDK ERROR',e&&e.message||e)}
+});
+</script></body></html>

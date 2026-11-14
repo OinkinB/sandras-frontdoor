@@ -1,0 +1,10 @@
+.env
+node_modules/
+output/
+__pycache__/
+sdk-test/config.js
+cache/
+blender/renders/
+*.blend1
+.claude/
+*.pyc
