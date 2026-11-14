@@ -42,6 +42,11 @@ bedrooms), finds existing barriers, picks a product and renders the fix before y
 | Blueprints: pages, `/api/*`, `/bundle/*` | `app/blueprints/` |
 | Tour: drag-select, 3D measurement, photo patches, re-render on move, agent | `app/static/js/tour.js` |
 
+### Reporting issues
+Click **Report issue** (top right) on any page: it screenshots what you see (the live 3D view on tour pages), lets you
+box or draw on what's wrong, and saves the note, screenshots and the app's state (camera position, room, selections,
+changes, recent API calls and errors) to `logs/feedback/<time>/`. Server errors go to `logs/server.log`.
+
 ### Tour controls
 - **W / S**: walk or select. Drag a box; **Shift+drag** adds more; **Esc** clears.
 - **Today / Plan / After**: the home as it is, outlines of planned changes, or the home with your changes.

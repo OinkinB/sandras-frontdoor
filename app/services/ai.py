@@ -160,10 +160,11 @@ At most 2 changes. Costs must be realistic for 2026. Never claim ADA compliance;
     return _as_obj(ask(prompt, imgs), "changes")
 
 
-def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str) -> dict:
+def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, instruction: str = "") -> dict:
     """First-pass agent: look at a few views of the home and pick the changes this user needs."""
     prompt = f"""You are an accessibility agent touring a home for a buyer. Buyer: {persona or 'not described'}; needs: {needs}.
 You get {len(views)} photos from the home's 3D tour (image i is view i; rooms: {rooms}).
+{('THE USER ASKED: "' + instruction + '". Find the existing object in the photo they mean and propose exactly that change (follow their wishes on details).') if instruction else ''}
 Find the concrete EXISTING barriers for THIS buyer and the change that fixes each: bathtub or curbed shower -> curbless
 roll-in shower, toilet without support -> grab bars beside it, stairs -> stairlift, narrow door -> wider door, step at
 entry -> ramp, carpet -> hard floor, high counters/cabinets -> roll-under. Always fix an existing object you can see;

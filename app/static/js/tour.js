@@ -40,7 +40,7 @@ iframe.addEventListener('load', async () => {
     sdk.Camera.pose.subscribe(onPose);
     await restoreEdits();
     hint('Press <b>S</b> and drag around anything to change it.', 6000);
-    if (!edits.length) startAgent();
+    if (!edits.length && NEEDS.length) offerAgent();
   } catch (e) { console.error(e); hint('3D tour failed to load: ' + (e.message || e)); }
 });
 
@@ -117,6 +117,17 @@ function patchCorners(rectN, pose = poseCache, d = 0.6) {
     return { x: c.x + r.x * k, y: c.y + r.y * k, z: c.z + r.z * k };
   });
 }
+/* Point the camera at an exact rotation. Camera.setRotation is sometimes ignored by the SDK, so
+   fall back to Camera.rotate (yaw changes by -h, pitch by +v) and verify we got there. */
+async function lookAt(rot) {
+  const off = () => { const c = poseCache.rotation; return { dy: ((rot.y - c.y + 540) % 360) - 180, dx: rot.x - c.x }; };
+  for (let k = 0; k < 4; k++) {
+    let { dy, dx } = off();
+    if (Math.abs(dy) < 0.6 && Math.abs(dx) < 0.6) return true;
+    await soon(sdk.Camera.rotate(-dy, dx, { speed: 10000 }), 2500); await sleep(250);
+  }
+  const { dy, dx } = off(); return Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5;
+}
 async function hitAt(x, y) {
   try { const d = await sdk.Renderer.getWorldPositionData({ x, y }); return d && d.position ? d.position : null; } catch { return null; }
 }
@@ -165,15 +176,23 @@ function projectBox(world, pose = poseCache) {
 let sweepList = [], roomList = [], roomIdx = 0;
 async function collect(obs) {
   const out = [];
-  await Promise.race([new Promise((r) => { const s = obs.subscribe({ onCollectionUpdated: (c) => { out.push(...Object.values(c)); setTimeout(() => s.cancel()); r(); } }); }), sleep(6000)]);
+  // the first update can arrive empty while the model is still loading; wait for real data
+  let sub;
+  await Promise.race([new Promise((r) => { sub = obs.subscribe({ onCollectionUpdated: (c) => {
+    const v = Object.values(c); if (v.length) { out.splice(0, out.length, ...v); r(); } } }); }), sleep(10000)]);
+  setTimeout(() => sub?.cancel?.());
   return out;
 }
 async function loadRooms() {
   sweepList = await collect(sdk.Sweep.data);
-  const rooms = await collect(sdk.Room.data).catch(() => []);
+  let rooms = await collect(sdk.Room.data).catch(() => []);
+  if (!rooms.filter((r) => r.label).length) {         // SDK room feed is sometimes empty: use the Matterport API rooms (same ids)
+    for (let i = 0; i < 100 && !info; i++) await sleep(100);
+    rooms = (info?.scan?.rooms || []).map((r) => ({ id: r.id, label: r.type }));
+  }
   const bySweep = {};
   for (const s of sweepList) if (s.roomInfo?.id) (bySweep[s.roomInfo.id] ||= []).push(s);
-  roomList = rooms.filter((r) => r.label && bySweep[r.id]).map((r) => ({ id: r.id, label: r.label.split(',')[0].trim(), sweeps: bySweep[r.id] }));
+  roomList = rooms.filter((r) => r.label && bySweep[r.id]).map((r) => ({ id: r.id, label: r.label.split(/,| \/ /)[0].trim(), sweeps: bySweep[r.id] }));
   const n = {}; roomList.forEach((r) => { n[r.label] = (n[r.label] || 0) + 1; r.k = n[r.label]; });
   roomList.forEach((r) => { if (n[r.label] > 1) r.label += ' ' + r.k; });
   $('#room-nav').classList.toggle('hidden', !roomList.length);
@@ -189,8 +208,8 @@ async function goRoom(i) {
   $('#room-name').textContent = roomList[roomIdx].label;
   await sdk.Sweep.moveTo(centerSweep(roomList[roomIdx]).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }).catch(() => {});
 }
-$('#room-prev').onclick = () => goRoom(roomIdx - 1);
-$('#room-next').onclick = () => goRoom(roomIdx + 1);
+$('#room-prev').onclick = () => { stopAgent(); goRoom(roomIdx - 1); };
+$('#room-next').onclick = () => { stopAgent(); goRoom(roomIdx + 1); };
 $('#room-name').onclick = () => {
   const m = $('#room-menu');
   m.innerHTML = roomList.map((r, i) => `<button data-i="${i}" class="block w-full text-left px-3 py-1.5 rounded-lg hover:bg-white/15">${r.label}</button>`).join('');
@@ -222,17 +241,26 @@ function refreshVisibility() {
     }
   }
 }
+// Re-render a change from a new scan point only when it is clearly in view: same room (or very
+// close), large enough on screen, and not hidden behind a wall. Far, tiny or occluded views
+// produce floating, wrong-looking patches, so those are skipped.
 async function renderMissingViews() {
-  if (!sdk || agentBusy || view !== 'after' || !poseCache) return;
-  const pose = poseCache;
+  if (!sdk || agentBusy || applying || view !== 'after' || !poseCache) return;
+  const pose = poseCache, W = iframe.clientWidth, Hh = iframe.clientHeight;
   for (const e of edits) {
     if (e.on === false || !e.world || e.patches.some((p) => p.sweep === pose.sweep)) continue;
     const key = `${e.id}@${pose.sweep}`;
-    if (pending.has(key) || dist(pose.position, e.world.center) > 7) continue;
+    const d = dist(pose.position, e.world.center);
+    const sameRoom = e.roomId && currentRoom()?.id === e.roomId;
+    if (pending.has(key) || d > 4.5 || (!sameRoom && d > 2.5)) continue;
     const r = projectBox(e.world, pose);
-    if (!r) continue;
-    const hit = await hitAt((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2);       // a wall in between?
-    if (hit && dist(pose.position, hit) < dist(pose.position, e.world.center) - Math.max(e.world.w, e.world.d)) continue;
+    if (!r || (r.x1 - r.x0) < 160 || (r.y1 - r.y0) < 140 || (r.x1 - r.x0) * (r.y1 - r.y0) < 0.06 * W * Hh) continue;
+    let clear = 0;                                                          // a wall in between?
+    for (const [u, v] of [[0.5, 0.5], [0.3, 0.35], [0.7, 0.35], [0.3, 0.7], [0.7, 0.7]]) {
+      const hit = await hitAt(r.x0 + (r.x1 - r.x0) * u, r.y0 + (r.y1 - r.y0) * v);
+      if (hit && dist(pose.position, hit) > d - Math.max(e.world.w, e.world.d) * 0.75) clear++;
+    }
+    if (clear < 4 || pose.sweep !== poseCache.sweep) continue;
     pending.add(key);
     status(`Rendering “${e.title}” from this spot…`);
     try { await renderPatch(e, r, pose); } catch (err) { console.warn(err); }
@@ -276,10 +304,23 @@ async function mountBox(e) {
   });
   (live[e.id] ||= { patches: {} }).box = n;
 }
+let applying = false;
 async function applyChange(sel, change, option, custom, agent = false) {
+  // The camera may have moved since the selection was made (walking, agent): return to that exact view first,
+  // otherwise the box would be applied to whatever is on screen now.
+  if (sel.pose && (poseCache.sweep !== sel.pose.sweep || Math.abs(poseCache.rotation.x - sel.pose.rot.x) + Math.abs(poseCache.rotation.y - sel.pose.rot.y) > 0.5)) {
+    if (poseCache.sweep !== sel.pose.sweep) { await soon(sdk.Sweep.moveTo(sel.pose.sweep, { transition: sdk.Sweep.Transition.INSTANT })); await sleep(700); }
+    const back = (await lookAt(sel.pose.rot)) && poseCache.sweep === sel.pose.sweep;
+    await sleep(500);
+    if (!back) {
+      bubble('I couldn\'t get back to the spot you selected from. Please select it again from where you are.');
+      return { e: null };
+    }
+  }
+  applying = true;
   const e = { id: 'e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), title: change.title, action: change.action,
     item: sel.item || change.item || '', option: option || null, custom: custom || '', options: change.options || [], world: sel.world,
-    cost: option ? option.total : 0, patches: [], agent, on: true, room: sel.roomLabel || currentRoom()?.label || '' };
+    cost: option ? option.total : 0, patches: [], agent, on: true, room: sel.roomLabel || currentRoom()?.label || '', roomId: sel.roomId || currentRoom()?.id || null };
   edits.push(e); save(); renderPlan();
   await mountBox(e);
   status(`Rendering “${e.title}”…`);
@@ -291,7 +332,7 @@ async function applyChange(sel, change, option, custom, agent = false) {
     removeEdit(e.id);
     bubble(`<span class="text-red-600">Could not render that change (${err.message}). Try a slightly larger selection.</span>`);
     return { e };
-  } finally { status(''); renderPlan(); }
+  } finally { applying = false; status(''); renderPlan(); }
 }
 
 /* ---------------- selection (drag marquee, Shift adds) ---------------- */
@@ -301,8 +342,9 @@ function setMode(m) {
   mode = m;
   overlay.style.pointerEvents = m === 'select' ? 'auto' : 'none';
   overlay.style.cursor = m === 'select' ? 'crosshair' : '';
-  $('#mode-select').className = 'px-3.5 py-1.5 rounded-full ' + (m === 'select' ? 'bg-white text-ink' : '');
-  $('#mode-walk').className = 'px-3.5 py-1.5 rounded-full ' + (m === 'walk' ? 'bg-white text-ink' : '');
+  $('#mode-select').className = 'px-4 py-2 rounded-full ' + (m === 'select' ? 'bg-brand-600 text-white' : '');
+  $('#mode-walk').className = 'px-4 py-2 rounded-full ' + (m === 'walk' ? 'bg-ink text-white' : '');
+  if (m === 'select') { stopAgent(); hint('Drag a box around what you want to change. <b>Shift</b>+drag to add more.', 5000); }
 }
 $('#mode-walk').onclick = () => setMode('walk');
 $('#mode-select').onclick = () => setMode('select');
@@ -344,7 +386,8 @@ async function addSelection(r) {
   const [uri, world] = await Promise.all([grabFrame(), worldFromRect(r)]);
   const img = new Image(); img.src = uri; await img.decode();
   const sel = { id: 's' + Date.now(), rect: r, world, box, crop: cropOf(img, r), full: cropOf(img, { x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, 1000),
-    label: 'Selection', roomLabel: currentRoom()?.label || '' };
+    label: 'Selection', roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null,
+    pose: { sweep: poseCache.sweep, rot: { ...poseCache.rotation } } };
   selections.push(sel); renderSelChips();
   analyze(sel);
 }
@@ -379,27 +422,37 @@ const compareHtml = (rid) => `<div class="mt-2 grid grid-cols-2 gap-1.5 text-[11
 
 function changeCard(sel, c) {
   const id = 'c' + Math.random().toString(36).slice(2, 8), opts = c.options || [];
+  let pick = Math.min(1, Math.max(0, opts.length - 1));
+  const detail = (o) => o ? `<div class="font-medium text-slate-800">${o.name}</div>
+      <div class="text-xs text-slate-500">Item ${money(o.material)} · Labor ${money(o.labor)} (${o.labor_hours} h × ${money(o.labor_rate)}/h)</div>
+      ${o.notes ? `<div class="text-xs text-slate-400 mt-0.5">${o.notes}</div>` : ''}` : '';
   setTimeout(() => {
     const root = document.getElementById(id); if (!root) return;
+    root.querySelectorAll('[data-tier]').forEach((b) => b.onclick = () => {
+      pick = +b.dataset.tier;
+      root.querySelectorAll('[data-tier]').forEach((x) => x.className = tierCls(+x.dataset.tier === pick));
+      root.querySelector('[data-detail]').innerHTML = detail(opts[pick]);
+    });
+    root.querySelector('[data-own]').onclick = (ev) => { ev.currentTarget.remove(); root.querySelector('[data-custom]').classList.remove('hidden'); root.querySelector('[data-custom]').focus(); };
     root.querySelector('[data-apply]').onclick = async (ev) => {
-      const b = ev.currentTarget; b.disabled = true; b.textContent = 'Rendering into the home…';
-      const i = +(root.querySelector('input[type=radio]:checked')?.value || 0);
-      const { meta } = await applyChange(sel, c, opts[i], root.querySelector('[data-custom]').value.trim());
-      b.textContent = meta ? 'Added to your plan ✓' : 'Try again'; b.disabled = !!meta;
-      if (meta) root.insertAdjacentHTML('beforeend', compareHtml(meta.id));
+      const b = ev.currentTarget; b.disabled = true; b.innerHTML = '<span class="dots">Rendering into the home<span>.</span><span>.</span><span>.</span></span>';
+      const { meta } = await applyChange(sel, c, opts[pick], root.querySelector('[data-custom]').value.trim());
+      b.textContent = meta ? '✓ In your plan, shown in the tour' : 'Try again'; b.disabled = !!meta;
+      if (meta) { b.className = 'mt-2 w-full text-sm font-semibold bg-emerald-50 text-emerald-700 rounded-lg px-3 py-2'; root.insertAdjacentHTML('beforeend', compareHtml(meta.id)); }
     };
   });
-  const tag = { remove: '− Remove', add: '+ Add', replace: '⇄ Replace' }[c.action] || c.action;
+  const tierCls = (on) => 'rounded-lg border px-2 py-1.5 text-left transition ' + (on ? 'border-brand-500 bg-brand-50 ring-1 ring-brand-500' : 'border-slate-200 hover:border-brand-300');
+  const tag = { remove: 'Remove', add: 'Add', replace: 'Replace' }[c.action] || c.action;
   return `<div id="${id}" class="mt-3 border border-slate-200 bg-white rounded-xl p-3">
-    <div class="text-[11px] font-bold uppercase tracking-wide text-slate-500">${tag}</div>
-    <div class="font-semibold">${c.title || ''}</div><div class="text-sm text-slate-600">${c.reason || ''}</div>
-    <div class="mt-2 space-y-1.5">${opts.map((o, i) => `<label class="flex gap-2 items-start border rounded-lg p-2 cursor-pointer hover:border-brand-400 has-[:checked]:border-brand-500 has-[:checked]:bg-brand-50">
-      <input type="radio" name="${id}" value="${i}" ${i === Math.min(1, opts.length - 1) ? 'checked' : ''} class="mt-1 accent-brand-600">
-      <span class="flex-1 text-sm"><span class="font-semibold">${o.tier}: ${o.name}</span>
-        <span class="block text-xs text-slate-500">Item ${money(o.material)} + labor ${o.labor_hours} h × ${money(o.labor_rate)}/h = ${money(o.labor)}${o.notes ? ' · ' + o.notes : ''}</span></span>
-      <span class="font-bold text-sm">${money(o.total)}</span></label>`).join('')}</div>
-    <input data-custom class="mt-2 w-full text-sm border rounded-lg px-2.5 py-1.5" placeholder="Or describe exactly what you want">
-    <button data-apply class="mt-2 w-full text-sm font-semibold bg-ink text-white rounded-lg px-3 py-2 hover:bg-brand-700">Show it in this home</button></div>`;
+    <div class="flex items-center gap-2"><span class="text-[10px] font-bold uppercase tracking-wide bg-slate-100 text-slate-600 rounded px-1.5 py-0.5">${tag}</span>
+      <span class="font-semibold leading-tight">${c.title || ''}</span></div>
+    ${c.reason ? `<div class="text-xs text-slate-500 mt-1 line-clamp-2">${c.reason}</div>` : ''}
+    ${opts.length ? `<div class="mt-2 grid grid-cols-${Math.min(3, opts.length)} gap-1.5">${opts.map((o, i) => `<button type="button" data-tier="${i}" class="${tierCls(i === pick)}">
+        <div class="text-[11px] text-slate-500">${o.tier}</div><div class="font-bold text-sm">${money(o.total)}</div></button>`).join('')}</div>
+      <div data-detail class="mt-2 text-sm">${detail(opts[pick])}</div>` : ''}
+    <button data-own class="mt-1 text-xs text-brand-700 hover:underline">Describe your own instead</button>
+    <input data-custom class="hidden mt-2 w-full text-sm border rounded-lg px-2.5 py-1.5" placeholder="e.g. white wall-hung sink, 34 in high">
+    <button data-apply class="mt-2 w-full text-sm font-semibold bg-ink text-white rounded-lg px-3 py-2 hover:bg-brand-700">Preview in this home</button></div>`;
 }
 async function analyze(sel, instruction) {
   const t = thinking('Looking at your selection');
@@ -412,8 +465,9 @@ async function analyze(sel, instruction) {
     sel.item = res.items?.[0]?.name || ''; sel.label = sel.item || 'Selection';
     const lbl = sel.box?.querySelector('.sel-label'); if (lbl) lbl.textContent = sel.label;
     renderSelChips();
-    bubble(`<div class="flex gap-3"><img src="${sel.crop}" class="w-14 h-14 rounded-lg object-cover shrink-0"><div>${res.summary || ''}
-      <ul class="mt-1 text-sm text-slate-600 list-disc pl-4">${(res.items || []).map((i) => `<li><b>${i.name}</b>: ${i.observation}</li>`).join('')}</ul></div></div>
+    bubble(`<div class="flex gap-3 items-start"><img src="${sel.crop}" class="w-12 h-12 rounded-lg object-cover shrink-0">
+      <div class="text-sm"><div class="font-semibold">${sel.label}</div><div class="text-slate-600">${res.summary || ''}</div>
+      ${(res.items || []).length ? `<details class="mt-1 text-xs text-slate-500"><summary class="cursor-pointer">What I see</summary><ul class="mt-1 list-disc pl-4">${res.items.map((i) => `<li><b>${i.name}</b>: ${i.observation}</li>`).join('')}</ul></details>` : ''}</div></div>
       ${(res.changes || []).map((c) => changeCard(sel, c)).join('')}`);
     chatHistory.push({ role: 'assistant', content: `Selection "${sel.label}": ${res.summary}` });
   } catch { t.remove(); bubble('<span class="text-red-600">Could not analyze that selection.</span>'); }
@@ -421,62 +475,100 @@ async function analyze(sel, instruction) {
 $('#chat-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const msg = $('#chat-input').value.trim(); if (!msg) return;
-  $('#chat-input').value = '';
+  $('#chat-input').value = ''; stopAgent();
   bubble(msg, 'user'); chatHistory.push({ role: 'user', content: msg });
   if (selections.length) { for (const s of selections) await analyze(s, msg); return; }
+  if (CHANGE_RE.test(msg)) { await findInView(msg); return; }   // no selection: find what they mean in the current view
   const t = thinking();
   const res = await fetch(`/api/home/${H.id}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: msg, history: chatHistory, edits: edits.map((e) => `${e.title} (${money(e.cost)})`) }) }).then((r) => r.json());
   t.remove(); bubble((res.reply || '').replace(/\n/g, '<br>')); chatHistory.push({ role: 'assistant', content: res.reply });
 });
 
-/* ---------------- agent first pass ---------------- */
+const CHANGE_RE = /(make|turn|change|replace|remove|add|convert|swap|put|install|get rid|widen|lower|raise|build|design|walk-?in|ramp|grab bar|stairlift|seat|door)/i;
+async function findInView(msg) {
+  const t = thinking('Finding that in your view');
+  const pose = { sweep: poseCache.sweep, rot: { ...poseCache.rotation } };
+  const image = await grabFrame();
+  const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ views: [{ image, room: currentRoom()?.label || '' }], needs: NEEDS, instruction: msg,
+      persona: sessionStorage.getItem('fd-persona') || '' }) }).then((r) => r.json()).catch(() => ({}));
+  t.remove();
+  const f = (plan.findings || [])[0];
+  if (!f?.box_2d) { bubble(`I couldn't spot that in this view. Turn toward it, or click <b>Select to change</b> and drag a box around it.`); return; }
+  const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d;
+  const rect = { x: b[1] / 1000 * W, y: b[0] / 1000 * Hh, w: (b[3] - b[1]) / 1000 * W, h: (b[2] - b[0]) / 1000 * Hh };
+  const img = new Image(); img.src = image; await img.decode();
+  const sel = { id: 's' + Date.now(), rect, world: await worldFromRect(rect), box: screenBox(rect, f.item || 'Found'), crop: cropOf(img, rect),
+    item: f.item, label: f.item || 'Selection', roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null, pose };
+  selections = [sel]; renderSelChips();
+  bubble(`<div class="flex gap-3 items-start"><img src="${sel.crop}" class="w-12 h-12 rounded-lg object-cover shrink-0">
+    <div class="text-sm"><div class="font-semibold">${f.item || ''}</div><div class="text-slate-600">${f.issue || ''}</div></div></div>${changeCard(sel, f)}`);
+}
+
+/* ---------------- agent first pass (only when you ask; stops as soon as you take over) ---------------- */
 const ROOM_PRIORITY = [/bath/i, /stair|hall/i, /bedroom/i, /kitchen/i, /laundry/i, /garage|entry|foyer/i];
+let agentAbort = false;
 function agentRooms() {
   const picks = [];
   for (const re of ROOM_PRIORITY) for (const r of roomList) if (re.test(r.label) && !picks.includes(r)) picks.push(r);
   return picks.filter((r) => !/closet|pantry/i.test(r.label)).slice(0, 3);
 }
+function offerAgent() {
+  const el = bubble(`<div class="font-semibold">Want me to check this home for you?</div>
+    <div class="text-sm text-slate-600 mt-0.5">I'll walk the bathrooms and bedrooms, find what doesn't fit your needs and show the fixes with prices. It takes about a minute and moves the tour while it works.</div>
+    <div class="mt-2 flex gap-2"><button data-go class="text-sm font-semibold bg-brand-600 text-white rounded-lg px-3 py-1.5 hover:bg-brand-700">Check this home</button>
+    <button data-no class="text-sm text-slate-600 rounded-lg px-3 py-1.5 hover:bg-slate-100">I'll look myself</button></div>`);
+  el.querySelector('[data-go]').onclick = () => { el.remove(); startAgent(); };
+  el.querySelector('[data-no]').onclick = () => el.remove();
+}
+function stopAgent() { if (agentBusy) agentAbort = true; }
 async function startAgent() {
-  if (!NEEDS.length || agentBusy || !roomList.length) return;
-  agentBusy = true; setMode('walk');
+  if (agentBusy || !roomList.length) return;
+  agentBusy = true; agentAbort = false; setMode('walk');
   try { await runAgent(); } catch (err) { console.error(err); bubble(`<span class="text-red-600">Agent stopped: ${err.message}</span>`); }
   finally { agentBusy = false; renderMissingViews(); }
 }
 async function runAgent() {
-  for (let i = 0; i < 50 && !poseCache; i++) await sleep(100);   // wait for the first camera pose
-  await sleep(2500);                                              // let the intro fly-in finish
+  for (let i = 0; i < 50 && !poseCache; i++) await sleep(100);
+  await sleep(1200);
   const startSweep = lastSweep, startRot = { ...poseCache.rotation };
   const rooms = agentRooms();
-  const log = bubble(`<div class="font-semibold">Agent walkthrough</div><div class="text-sm text-slate-500">Checking ${rooms.map((r) => r.label).join(', ')} for your needs and rendering each fix into the home.</div><ul class="mt-2 text-sm space-y-2" data-steps></ul>`);
+  const log = bubble(`<div class="flex items-center"><div class="font-semibold">Checking ${rooms.map((r) => r.label).join(', ')}</div>
+    <button data-stop class="ml-auto text-xs text-slate-500 hover:text-red-600 border rounded-md px-2 py-0.5">Stop</button></div><ul class="mt-2 text-sm space-y-2" data-steps></ul>`);
+  log.querySelector('[data-stop]').onclick = () => { agentAbort = true; };
   const step = (t) => { const li = document.createElement('li'); li.innerHTML = t; log.querySelector('[data-steps]').appendChild(li); $('#chat').scrollTop = 1e9; return li; };
   let found = 0;
   for (const room of rooms) {
-    const li = step(`⏳ ${room.label}: looking around…`);
+    if (agentAbort) break;
+    const li = step(`<span class="dots">${room.label}: looking around<span>.</span><span>.</span><span>.</span></span>`);
     await soon(sdk.Sweep.moveTo(centerSweep(room).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 600 }));
     await sleep(900);
     const views = [];
-    for (let k = 0; k < 4; k++) {
-      await soon(sdk.Camera.setRotation({ x: -18, y: k * 90 }, { speed: 10000 })); await sleep(450);
+    for (let k = 0; k < 4 && !agentAbort; k++) {
+      await lookAt({ x: -18, y: k * 90 }); await sleep(450);
       views.push({ image: await soon(sdk.Renderer.takeScreenShot({ width: 768, height: 576 }, { mattertags: false, sweeps: false }), 8000), room: room.label, rot: { x: -18, y: k * 90 } });
     }
+    if (agentAbort) { li.remove(); break; }
     const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ views, needs: NEEDS, persona: sessionStorage.getItem('fd-persona') || '' }) }).then((r) => r.json()).catch(() => ({}));
+    if (agentAbort) { li.remove(); break; }
     const f = (plan.findings || [])[0];
-    if (!f) { li.innerHTML = `✓ ${room.label}: nothing to change`; continue; }
-    li.innerHTML = `🔧 ${room.label}: ${f.item}, ${f.issue}. Rendering <b>${f.title}</b>…`;
-    await soon(sdk.Camera.setRotation(views[f.view]?.rot || views[0].rot, { speed: 10000 })); await sleep(700);
+    if (!f) { li.innerHTML = `✓ ${room.label}: fine as is`; continue; }
+    li.innerHTML = `<span class="dots">${room.label}: ${f.item}. Rendering <b>${f.title}</b><span>.</span><span>.</span><span>.</span></span>`;
+    await lookAt(views[f.view]?.rot || views[0].rot); await sleep(700);
     const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d || [300, 300, 700, 700];
     const rect = { x: b[1] / 1000 * W, y: b[0] / 1000 * Hh, w: (b[3] - b[1]) / 1000 * W, h: (b[2] - b[0]) / 1000 * Hh };
     const world = await worldFromRect(rect);
     const opt = (f.options || [])[1] || (f.options || [])[0];
-    const { meta } = await applyChange({ rect, world, item: f.item, roomLabel: room.label }, f, opt, '', true);
+    const { meta } = await applyChange({ rect, world, item: f.item, roomLabel: room.label, roomId: room.id }, f, opt, '', true);
     found += meta ? 1 : 0;
-    li.innerHTML = meta ? `✅ ${room.label}: <b>${f.title}</b>: ${opt?.name || ''}, ${money(opt?.total)}${compareHtml(meta.id)}` : `⚠️ ${room.label}: couldn't render ${f.title}`;
+    li.innerHTML = meta ? `✅ ${room.label}: <b>${f.title}</b>, ${opt?.name || ''} (${money(opt?.total)})${compareHtml(meta.id)}` : `⚠️ ${room.label}: couldn't render ${f.title}`;
   }
-  step(found ? `<b>${found} suggested change${found > 1 ? 's' : ''}</b> are in the tour now. Walk around to see them; swap products or switch them off in Plan.` : 'No changes needed for your needs.');
+  if (agentAbort) { step('Stopped. The tour is yours.'); return; }
+  step(found ? `<b>${found} change${found > 1 ? 's' : ''}</b> added. Walk around to see them; swap products or switch them off in <b>Plan</b>.` : 'Nothing to change for your needs.');
   await soon(sdk.Sweep.moveTo(startSweep, { transition: sdk.Sweep.Transition.FLY, transitionTime: 600 }));
-  await soon(sdk.Camera.setRotation(startRot, { speed: 10000 }));
+  await lookAt(startRot);
 }
 $('#agent-run').onclick = () => startAgent();
 
@@ -528,7 +620,7 @@ async function flyTo(e) {
   if (!e?.patches.length) return;
   switchView('tour');
   await sdk.Sweep.moveTo(e.patches[0].sweep, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }).catch(() => {});
-  await soon(sdk.Camera.setRotation(e.patches[0].rot || poseCache.rotation, { speed: 10000 }));   // the exact angle it was rendered from
+  await lookAt(e.patches[0].rot || poseCache.rotation);   // the exact angle it was rendered from
 }
 function setView(v) {
   view = v; refreshVisibility();
@@ -580,6 +672,32 @@ function status(t) { const s = $('#render-status'); s.textContent = t; s.classLi
   info = await fetch(`/api/home/${H.id}?needs=${NEEDS.join(',')}`).then((r) => r.json());
   renderAccess(info); loadOutside();
   const v = info.evidence;
-  bubble(`<div class="font-semibold">${info.match}% match for your needs</div><ul class="mt-1 text-sm">${NEEDS.map((k) => v[k]).filter(Boolean)
-    .map((x) => `<li><span class="status-${x.status} font-bold">${STATUS[x.status][0]}</span> ${x.label}</li>`).join('')}</ul>`);
+  const lines = NEEDS.map((k) => v[k]).filter(Boolean);
+  bubble(`<div class="flex items-baseline gap-2"><div class="text-2xl font-extrabold text-brand-700">${info.match}%</div><div class="font-semibold">match for your needs</div></div>
+    ${lines.length ? `<ul class="mt-1 text-sm grid grid-cols-2 gap-x-3">${lines.map((x) => `<li><span class="status-${x.status} font-bold">${STATUS[x.status][0]}</span> ${x.label}</li>`).join('')}</ul>` : ''}
+    <ol class="mt-3 text-sm text-slate-600 space-y-1 list-decimal pl-5">
+      <li>Walk around the tour (drag to look, click the floor to move).</li>
+      <li>Click <b>Select to change</b> and drag a box around anything.</li>
+      <li>Pick an option and press <b>Preview in this home</b>.</li></ol>`);
 })();
+
+/* hooks for the issue reporter (report.js): capture the 3D view and the app state */
+window.FD_SHOT = async () => {
+  const W = iframe.clientWidth, Hh = iframe.clientHeight;
+  const tour = sdk ? await soon(sdk.Renderer.takeScreenShot({ width: W, height: Hh }, { mattertags: false, sweeps: true }), 6000) : null;
+  if (!tour) throw new Error('no tour');
+  // draw the visible selection boxes on top so the report shows what was selected
+  const img = new Image(); img.src = tour; await img.decode();
+  const c = document.createElement('canvas'); c.width = W; c.height = Hh; const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, W, Hh);
+  ctx.strokeStyle = '#7c5cff'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+  overlay.querySelectorAll('.sel-box').forEach((el) => ctx.strokeRect(el.offsetLeft, el.offsetTop, el.offsetWidth, el.offsetHeight));
+  return c.toDataURL('image/png');
+};
+window.FD_CONTEXT = async () => ({
+  home: { id: H.id, address: H.address, matterport: H.matterport_id }, needs: NEEDS, view, mode, agentBusy, applying,
+  pose: poseCache && { sweep: poseCache.sweep, position: poseCache.position, rotation: poseCache.rotation, mode: poseCache.mode },
+  room: currentRoom()?.label || null,
+  selections: selections.map((s) => ({ label: s.label, rect: s.rect, pose: s.pose, world: s.world })),
+  edits: edits.map(({ options, ...e }) => e),
+  chat: [...document.querySelectorAll('#chat > div')].slice(-30).map((d) => d.innerText.slice(0, 600)),
+});

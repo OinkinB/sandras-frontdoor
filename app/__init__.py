@@ -1,5 +1,7 @@
 """Sandra's FrontDoor: accessible home search with editable 3D tours."""
+import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,8 +21,16 @@ def create_app() -> Flask:
         CACHE_DIR=Path(os.environ.get("CACHE_DIR", ROOT / "cache")),
         BUNDLE_DIR=Path(os.environ.get("BUNDLE_DIR", ROOT / "sdk-test" / "node_modules" / "@matterport" / "webcomponent" / "built-bundle")),
         MATTERPORT_SDK_KEY=os.environ.get("MATTERPORT_SDK_KEY", ""),
+        LOG_DIR=Path(os.environ.get("LOG_DIR", ROOT / "logs")),
     )
     app.config["CACHE_DIR"].mkdir(parents=True, exist_ok=True)
+    app.config["LOG_DIR"].mkdir(parents=True, exist_ok=True)
+    # server log: every API error and issue report lands in logs/server.log
+    fh = RotatingFileHandler(app.config["LOG_DIR"] / "server.log", maxBytes=2_000_000, backupCount=3, encoding="utf8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    fh.setLevel(logging.INFO)
+    app.logger.addHandler(fh)
+    app.logger.setLevel(logging.INFO)
 
     from .services import listings
     listings.load(KIT)
@@ -28,7 +38,9 @@ def create_app() -> Flask:
     from .blueprints.main import bp as main_bp
     from .blueprints.api import bp as api_bp
     from .blueprints.bundle import bp as bundle_bp
+    from .blueprints.feedback import bp as feedback_bp
     app.register_blueprint(main_bp)
     app.register_blueprint(api_bp, url_prefix="/api")
     app.register_blueprint(bundle_bp, url_prefix="/bundle")
+    app.register_blueprint(feedback_bp, url_prefix="/api")
     return app

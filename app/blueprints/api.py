@@ -138,6 +138,7 @@ def analyze(home_id):
         res = ai.analyze_selection(_b64img(b["crop"]), _b64img(b.get("full")), b.get("room", ""),
                                    b.get("instruction"), b.get("size"), b.get("needs"))
     except Exception as e:
+        current_app.logger.error("AI error on %s: %s", request.path, e)
         return jsonify({"error": f"AI unavailable: {e}"[:300]}), 502
     for c in res.get("changes") or []:
         _price_options(c)
@@ -157,6 +158,7 @@ def render(home_id):
     try:
         meta = imaging.render(_b64img(b["image"]), b["rect"], b["task"], out_dir, ref)
     except Exception as e:
+        current_app.logger.error("Render error on %s: %s", request.path, e)
         return jsonify({"error": f"Render failed: {e}"[:300]}), 502
     return jsonify(meta)
 
@@ -180,8 +182,10 @@ def agent_plan(home_id):
     b = request.get_json(force=True)
     views = [_b64img(v["image"]) for v in b.get("views") or []][:8]
     try:
-        res = ai.agent_plan(views, [v.get("room", "") for v in b.get("views") or []], b.get("needs") or [], b.get("persona", ""))
+        res = ai.agent_plan(views, [v.get("room", "") for v in b.get("views") or []], b.get("needs") or [], b.get("persona", ""),
+                           b.get("instruction", ""))
     except Exception as e:
+        current_app.logger.error("AI error on %s: %s", request.path, e)
         return jsonify({"error": f"AI unavailable: {e}"[:300]}), 502
     for f in res.get("findings") or []:
         _price_options(f)

@@ -8,3 +8,4 @@ blender/renders/
 *.blend1
 .claude/
 *.pyc
+logs/
