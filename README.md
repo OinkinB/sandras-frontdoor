@@ -47,6 +47,13 @@ Click **Report issue** (top right) on any page: it screenshots what you see (the
 box or draw on what's wrong, and saves the note, screenshots and the app's state (camera position, room, selections,
 changes, recent API calls and errors) to `logs/feedback/<time>/`. Server errors go to `logs/server.log`.
 
+### Making changes
+- **Select to change** (or **S**), then **Draw** around anything (freehand) or use **Box**. **Shift** adds more.
+- A menu opens next to it: **Remove it**, **Replace with…**, **Add here…**, **What would help here?**, or type anything.
+- The selection captures that exact view, so the change renders in the background: keep walking and make more
+  changes in other rooms. Each one is highlighted in purple in 3D while it works, and the **Changes** tab shows live
+  status (Thinking → Rendering → Ready) with thumbnails, prices, product swaps and an Include toggle.
+
 ### Tour controls
 - **W / S**: walk or select. Drag a box; **Shift+drag** adds more; **Esc** clears.
 - **Today / Plan / After**: the home as it is, outlines of planned changes, or the home with your changes.

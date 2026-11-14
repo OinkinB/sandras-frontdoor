@@ -156,7 +156,7 @@ def render(home_id):
         f = out_dir / f"{b['ref']}_ref.png"
         ref = f.read_bytes() if f.exists() else None
     try:
-        meta = imaging.render(_b64img(b["image"]), b["rect"], b["task"], out_dir, ref)
+        meta = imaging.render(_b64img(b["image"]), b["rect"], b["task"], out_dir, ref, b.get("poly"))
     except Exception as e:
         current_app.logger.error("Render error on %s: %s", request.path, e)
         return jsonify({"error": f"Render failed: {e}"[:300]}), 502

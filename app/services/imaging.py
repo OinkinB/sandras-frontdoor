@@ -17,6 +17,8 @@ PROMPT = """This is a real photograph from a 3D tour of a home (image 1). Image 
 Task: {task}
 Requirements:
 - Photorealistic, as if the change was really installed and then photographed with the same camera.
+- Show the FINISHED result after the work is complete: painted, trimmed, cleaned up, move-in ready. Never show a
+  construction site, exposed framing or studs, bare drywall, tape, tools, debris or protective plastic.
 - Keep the exact same camera position, field of view, perspective lines and vanishing points.
 - Match this photo's lighting direction, exposure, white balance, shadows, reflections, grain and lens softness.
 - Correct real-world scale for the room; the new item must sit on the real floor/wall with contact shadows.
@@ -35,7 +37,8 @@ def _png(img: Image.Image) -> bytes:
     b = io.BytesIO(); img.save(b, "PNG", optimize=True); return b.getvalue()
 
 
-def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_png: bytes | None = None) -> dict:
+def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_png: bytes | None = None,
+           poly: list | None = None) -> dict:
     """rect = [x0, y0, x1, y1] normalized (0-1) in the full view. Returns patch + metadata."""
     full = Image.open(io.BytesIO(full_jpeg)).convert("RGB")
     W, H = full.size
@@ -51,7 +54,12 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
     grow = 0.08 * max(sw, sh)            # edit slightly beyond the drawn box (new items rarely match it exactly)
     sel = (x0 - cx0 - grow, y0 - cy0 - grow, x1 - cx0 + grow, y1 - cy0 + grow)
     mask = Image.new("L", (cw, ch), 0)
-    ImageDraw.Draw(mask).rectangle(sel, fill=255)
+    if poly and len(poly) > 2:          # lasso: mask the drawn shape, grown a little so the new item can fit
+        pts = [(x * W - cx0, y * H - cy0) for x, y in poly]
+        ImageDraw.Draw(mask).polygon(pts, fill=255)
+        mask = mask.filter(ImageFilter.MaxFilter(min(31, max(3, int(grow) * 2 + 1)) | 1))
+    else:
+        ImageDraw.Draw(mask).rectangle(sel, fill=255)
 
     imgs = [("image/jpeg", _jpeg(ctx)), ("image/png", _png(mask.convert("RGB")))]
     if ref_png:
@@ -67,9 +75,12 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
 
     # feathered alpha: full strength inside the selection, soft falloff around it
     feather = max(6, int(0.06 * max(sw, sh)))
-    alpha = Image.new("L", (cw, ch), 0)
-    ImageDraw.Draw(alpha).rectangle((sel[0] - feather / 2, sel[1] - feather / 2, sel[2] + feather / 2, sel[3] + feather / 2), fill=255)
-    alpha = alpha.filter(ImageFilter.GaussianBlur(feather))
+    if poly and len(poly) > 2:
+        alpha = mask.filter(ImageFilter.MaxFilter(min(21, max(3, feather)) | 1)).filter(ImageFilter.GaussianBlur(feather))
+    else:
+        alpha = Image.new("L", (cw, ch), 0)
+        ImageDraw.Draw(alpha).rectangle((sel[0] - feather / 2, sel[1] - feather / 2, sel[2] + feather / 2, sel[3] + feather / 2), fill=255)
+        alpha = alpha.filter(ImageFilter.GaussianBlur(feather))
     patch = out.copy(); patch.putalpha(alpha)
     bbox = alpha.point(lambda v: 255 if v > 3 else 0).getbbox() or (0, 0, cw, ch)
     patch = patch.crop(bbox)

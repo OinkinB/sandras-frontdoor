@@ -54,6 +54,10 @@
       </div>
 
       <!-- primary action: big, obvious select toggle -->
+      <div id="tool-pick" class="hidden absolute bottom-[4.25rem] right-4 z-30 flex bg-black/60 backdrop-blur rounded-full p-1 text-xs font-semibold">
+        <button data-tool-pick="lasso" class="px-3 py-1.5 rounded-full bg-white text-ink">✎ Draw</button>
+        <button data-tool-pick="box" class="px-3 py-1.5 rounded-full text-white">▢ Box</button>
+      </div>
       <div class="absolute bottom-4 right-4 z-30 flex bg-white rounded-full shadow-lg p-1 text-sm font-semibold">
         <button id="mode-walk" class="px-4 py-2 rounded-full bg-ink text-white" title="Walk around (W)">Walk</button>
         <button id="mode-select" class="px-4 py-2 rounded-full" title="Drag a box around anything to change it (S)">Select to change</button>
@@ -67,7 +71,7 @@
   <aside class="bg-white rounded-2xl shadow-card flex flex-col min-h-[560px] xl:min-h-0 overflow-hidden">
     <div class="px-4 border-b border-slate-200 flex gap-5 overflow-x-auto shrink-0" role="tablist" id="panel-tabs">
       <button class="tab-btn" data-tab="assistant" aria-selected="true">Agent</button>
-      <button class="tab-btn" data-tab="plan" aria-selected="false">Plan <span id="plan-count" class="text-xs bg-brand-100 text-brand-700 rounded-full px-1.5">0</span></button>
+      <button class="tab-btn" data-tab="plan" aria-selected="false">Changes <span id="plan-count" class="text-xs bg-brand-100 text-brand-700 rounded-full px-1.5">0</span></button>
       <button class="tab-btn" data-tab="access" aria-selected="false">Accessibility</button>
       <button class="tab-btn" data-tab="outside" aria-selected="false">Outside</button>
     </div>

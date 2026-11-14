@@ -234,7 +234,7 @@ function onPose(p) {
 function refreshVisibility() {
   for (const e of edits) {
     const L = live[e.id]; if (!L) continue;
-    if (L.box) { comp(L.box).inputs.visible = view === 'plan' && e.on !== false; comp(L.box).onInputsUpdated(); }
+    if (L.box) { comp(L.box).inputs.visible = e.on !== false && (view === 'plan' || (e.status && e.status !== 'done' && e.status !== 'failed')); comp(L.box).onInputsUpdated(); }
     for (const [sw, n] of Object.entries(L.patches)) {
       comp(n).inputs.visible = view === 'after' && sw === lastSweep && e.on !== false;
       comp(n).onInputsUpdated();
@@ -245,10 +245,10 @@ function refreshVisibility() {
 // close), large enough on screen, and not hidden behind a wall. Far, tiny or occluded views
 // produce floating, wrong-looking patches, so those are skipped.
 async function renderMissingViews() {
-  if (!sdk || agentBusy || applying || view !== 'after' || !poseCache) return;
+  if (!sdk || agentBusy || view !== 'after' || !poseCache) return;
   const pose = poseCache, W = iframe.clientWidth, Hh = iframe.clientHeight;
   for (const e of edits) {
-    if (e.on === false || !e.world || e.patches.some((p) => p.sweep === pose.sweep)) continue;
+    if (e.on === false || !e.world || (e.status && e.status !== 'done') || e.patches.some((p) => p.sweep === pose.sweep)) continue;
     const key = `${e.id}@${pose.sweep}`;
     const d = dist(pose.position, e.world.center);
     const sameRoom = e.roomId && currentRoom()?.id === e.roomId;
@@ -268,26 +268,34 @@ async function renderMissingViews() {
   }
 }
 
-/* ---------------- photoreal render at the current view ---------------- */
+/* ---------------- photoreal render ----------------
+ * A selection captures the exact frame and camera pose the moment you make it. Renders use that
+ * captured frame, never "whatever is on screen now", so you can keep walking while they run in the
+ * background, and a change can never land on the wrong view. */
 async function grabFrame() {
   const W = iframe.clientWidth, Hh = iframe.clientHeight, k = Math.min(2, 1600 / W);
   return sdk.Renderer.takeScreenShot({ width: Math.round(W * k), height: Math.round(Hh * k) }, { mattertags: false, sweeps: false });
 }
+const snapPose = (p = poseCache) => ({ sweep: p.sweep, position: { ...p.position }, rotation: { ...p.rotation },
+  projection: p.projection ? Array.from(p.projection) : null, W: iframe.clientWidth, H: iframe.clientHeight });
 function taskText(e) {
   const what = e.custom || (e.option ? `${e.option.name} (${e.option.spec})` : e.title);
   if (e.action === 'remove') return `Remove ${e.item || 'the selected item'} completely and fill the space with the surrounding floor and wall. ${e.custom || ''}`;
   if (e.action === 'add') return `Install ${what} here. Purpose: ${e.title}.`;
   return `Replace ${e.item || 'what is in the masked area'} with ${what}. Purpose: ${e.title}.`;
 }
-async function renderPatch(e, r, pose = poseCache) {
-  const W = iframe.clientWidth, Hh = iframe.clientHeight;
-  const image = await grabFrame();
+// r: {x0,y0,x1,y1} in css px of the view `pose` was taken at; poly: optional lasso points (css px)
+async function renderPatch(e, r, pose, image, poly) {
+  pose = pose || snapPose();
+  const W = pose.W || iframe.clientWidth, Hh = pose.H || iframe.clientHeight;
+  image = image || await grabFrame();
   const meta = await fetch(`/api/home/${H.id}/render`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image, rect: [r.x0 / W, r.y0 / Hh, r.x1 / W, r.y1 / Hh], task: taskText(e), ref: e.ref || null }) }).then((x) => x.json());
+    body: JSON.stringify({ image, rect: [r.x0 / W, r.y0 / Hh, r.x1 / W, r.y1 / Hh], task: taskText(e), ref: e.ref || null,
+      poly: poly ? poly.map(([x, y]) => [x / W, y / Hh]) : null }) }).then((x) => x.json());
   if (meta.error) throw new Error(meta.error);
   if (!e.ref) e.ref = meta.id;
   const p = { sweep: pose.sweep, rid: meta.id, corners: patchCorners(meta.rect, pose), rot: { ...pose.rotation } };
-  e.patches.push(p); save();
+  e.patches.push(p); e.thumb = meta.id; save();
   await mountPatch(e, p);
   refreshVisibility();
   return meta;
@@ -296,83 +304,143 @@ async function mountPatch(e, p) {
   const n = await addNode('fd.photo', { url: `/api/home/${H.id}/render/${p.rid}/patch`, corners: p.corners, visible: false });
   (live[e.id] ||= { patches: {} }).patches[p.sweep] = n;
 }
+const BOX_COLOR = { pending: 0x7c5cff, add: 0x22c55e, remove: 0xef4444, replace: 0xf59e0b };
 async function mountBox(e) {
   const w = e.world; if (!w) return;
-  const n = await addNode('fd.planbox', { w: w.w, h: w.h, d: w.d, color: e.action === 'add' ? 0x22c55e : e.action === 'remove' ? 0xef4444 : 0xf59e0b, visible: false }, (n) => {
+  const n = await addNode('fd.planbox', { w: w.w, h: w.h, d: w.d, color: BOX_COLOR[e.status === 'done' ? e.action : 'pending'] || BOX_COLOR.replace, visible: true }, (n) => {
     n.position.set(w.center.x, w.center.y, w.center.z);
     n.quaternion.setFromAxisAngle({ x: 0, y: 1, z: 0 }, w.yaw);
   });
   (live[e.id] ||= { patches: {} }).box = n;
 }
-let applying = false;
-async function applyChange(sel, change, option, custom, agent = false) {
-  // The camera may have moved since the selection was made (walking, agent): return to that exact view first,
-  // otherwise the box would be applied to whatever is on screen now.
-  if (sel.pose && (poseCache.sweep !== sel.pose.sweep || Math.abs(poseCache.rotation.x - sel.pose.rot.x) + Math.abs(poseCache.rotation.y - sel.pose.rot.y) > 0.5)) {
-    if (poseCache.sweep !== sel.pose.sweep) { await soon(sdk.Sweep.moveTo(sel.pose.sweep, { transition: sdk.Sweep.Transition.INSTANT })); await sleep(700); }
-    const back = (await lookAt(sel.pose.rot)) && poseCache.sweep === sel.pose.sweep;
-    await sleep(500);
-    if (!back) {
-      bubble('I couldn\'t get back to the spot you selected from. Please select it again from where you are.');
-      return { e: null };
-    }
-  }
-  applying = true;
-  const e = { id: 'e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), title: change.title, action: change.action,
-    item: sel.item || change.item || '', option: option || null, custom: custom || '', options: change.options || [], world: sel.world,
-    cost: option ? option.total : 0, patches: [], agent, on: true, room: sel.roomLabel || currentRoom()?.label || '', roomId: sel.roomId || currentRoom()?.id || null };
-  edits.push(e); save(); renderPlan();
-  await mountBox(e);
-  status(`Rendering “${e.title}”…`);
-  try {
-    const meta = await renderPatch(e, { x0: sel.rect.x, y0: sel.rect.y, x1: sel.rect.x + sel.rect.w, y1: sel.rect.y + sel.rect.h });
-    sel.box?.remove();
-    return { e, meta };
-  } catch (err) {
-    removeEdit(e.id);
-    bubble(`<span class="text-red-600">Could not render that change (${err.message}). Try a slightly larger selection.</span>`);
-    return { e };
-  } finally { applying = false; status(''); renderPlan(); }
+function boxColor(e) {
+  const n = live[e.id]?.box; if (!n) return;
+  const c = comp(n); c.inputs.color = e.status === 'done' ? (BOX_COLOR[e.action] || BOX_COLOR.replace) : BOX_COLOR.pending; c.onInputsUpdated();
 }
 
-/* ---------------- selection (drag marquee, Shift adds) ---------------- */
+/* ---------------- jobs: several changes can be in flight while you keep touring ---------------- */
+let jobsRunning = 0;
+const selFor = new Map();   // editId -> selection (keeps the captured frame in memory for re-renders)
+const applying = false;    // kept for the issue reporter's context
+function jobStatus() {
+  const n = edits.filter((e) => e.status === 'analyzing' || e.status === 'rendering').length;
+  status(n ? `${n} change${n > 1 ? 's' : ''} in progress. Keep exploring, they'll appear when ready.` : '');
+}
+function newEdit(sel, fields) {
+  const e = { id: 'e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), title: 'Working on it…', action: 'replace',
+    item: sel.item || '', option: null, custom: '', options: [], world: sel.world, cost: 0, patches: [], agent: false, on: true,
+    room: sel.roomLabel || '', roomId: sel.roomId || null, status: 'analyzing', crop: sel.crop, ...fields };
+  selFor.set(e.id, sel);
+  edits.push(e); save(); renderPlan(); jobStatus();
+  if (sel.marker) { (live[e.id] ||= { patches: {} }).box = sel.marker; sel.marker = null; } else mountBox(e);
+  return e;
+}
+// Render an edit from the selection's captured frame (no camera movement needed).
+async function runRender(e, sel) {
+  e.status = 'rendering'; boxColor(e); save(); renderPlan(); jobStatus();
+  jobsRunning++;
+  try {
+    const r = { x0: sel.rect.x, y0: sel.rect.y, x1: sel.rect.x + sel.rect.w, y1: sel.rect.y + sel.rect.h };
+    const meta = await renderPatch(e, r, sel.pose, sel.frame, sel.poly);
+    e.status = 'done'; boxColor(e); save(); refreshVisibility();
+    return meta;
+  } catch (err) {
+    e.status = 'failed'; e.error = err.message; save();
+    return null;
+  } finally { jobsRunning--; renderPlan(); jobStatus(); }
+}
+// Used by option cards and the agent: create + render in one go.
+async function applyChange(sel, change, option, custom, agent = false) {
+  const e = newEdit(sel, { title: change.title, action: change.action, item: sel.item || change.item || '', option: option || null,
+    custom: custom || '', options: change.options || [], cost: option ? option.total : 0, agent, status: 'rendering' });
+  const meta = await runRender(e, sel);
+  sel.box?.remove();
+  return { e, meta };
+}
+// A direct command on a selection ("remove it", "replace with ..."): analyze, pick the standard option, render. No extra clicks.
+async function command(sel, instruction, label) {
+  hideMenu();
+  sel.box?.remove(); selections = selections.filter((x) => x !== sel); renderSelChips();   // it's a change now, tracked in Changes
+  const e = newEdit(sel, { title: label || instruction });
+  bubble(`<div class="flex gap-3 items-center"><img src="${sel.crop}" class="w-10 h-10 rounded-lg object-cover shrink-0">
+    <div class="text-sm"><b>${label || instruction}</b><div class="text-slate-500">Working on it in the background. Keep exploring; it shows up in <b>Changes</b> and in the tour when ready.</div></div></div>`);
+  try {
+    const res = await fetch(`/api/home/${H.id}/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ crop: sel.crop, full: sel.full, instruction, room: sel.roomLabel, needs: NEEDS,
+        size: sel.world && { w: sel.world.w, h: sel.world.h, d: sel.world.d, rise: sel.world.rise } }) }).then((r) => r.json());
+    if (res.error) throw new Error(res.error);
+    const c = (res.changes || [])[0];
+    if (!c) throw new Error('no change proposed');
+    const opt = (c.options || [])[Math.min(1, (c.options || []).length - 1)] || null;
+    Object.assign(e, { title: c.title, action: c.action, item: res.items?.[0]?.name || sel.item || '', options: c.options || [], option: opt,
+      cost: opt?.total || 0, custom: /replace|add|install|put/i.test(instruction) ? instruction : '' });
+    sel.item = e.item;
+    await runRender(e, sel);
+  } catch (err) {
+    e.status = 'failed'; e.error = err.message; save(); renderPlan(); jobStatus();
+  }
+}
+
+/* ---------------- selection: box or lasso, kept pinned in 3D, with an action menu ---------------- */
 const overlay = $('#overlay');
-let drag = null;
+let drag = null, tool = 'lasso';
 function setMode(m) {
   mode = m;
   overlay.style.pointerEvents = m === 'select' ? 'auto' : 'none';
   overlay.style.cursor = m === 'select' ? 'crosshair' : '';
   $('#mode-select').className = 'px-4 py-2 rounded-full ' + (m === 'select' ? 'bg-brand-600 text-white' : '');
   $('#mode-walk').className = 'px-4 py-2 rounded-full ' + (m === 'walk' ? 'bg-ink text-white' : '');
-  if (m === 'select') { stopAgent(); hint('Drag a box around what you want to change. <b>Shift</b>+drag to add more.', 5000); }
+  $('#tool-pick').classList.toggle('hidden', m !== 'select');
+  if (m === 'select') { stopAgent(); hint(tool === 'lasso' ? 'Draw around what you want to change. <b>Shift</b> adds more.' : 'Drag a box around what you want to change. <b>Shift</b> adds more.', 5000); }
+  else hideMenu();
 }
+function setTool(t) {
+  tool = t;
+  for (const b of document.querySelectorAll('[data-tool-pick]')) b.className = 'px-3 py-1.5 rounded-full ' + (b.dataset.toolPick === t ? 'bg-white text-ink' : 'text-white');
+}
+document.querySelectorAll('[data-tool-pick]').forEach((b) => b.onclick = () => setTool(b.dataset.toolPick));
 $('#mode-walk').onclick = () => setMode('walk');
 $('#mode-select').onclick = () => setMode('select');
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
   if (e.key === 's' || e.key === 'S') setMode('select');
   if (e.key === 'w' || e.key === 'W') setMode('walk');
-  if (e.key === 'Escape') { selections.forEach((s) => s.box?.remove()); selections = []; renderSelChips(); }
+  if (e.key === 'Escape') clearSelections();
 });
+const svgNS = 'http://www.w3.org/2000/svg';
 overlay.addEventListener('pointerdown', (e) => {
-  if (mode !== 'select' || !sdk) return;
-  const b = overlay.getBoundingClientRect();
-  drag = { x0: e.clientX - b.left, y0: e.clientY - b.top, add: e.shiftKey || e.ctrlKey, el: document.createElement('div') };
-  drag.el.className = 'marquee'; overlay.appendChild(drag.el); overlay.setPointerCapture(e.pointerId);
+  if (mode !== 'select' || !sdk || e.target.closest('#sel-menu')) return;
+  const b = overlay.getBoundingClientRect(), x = e.clientX - b.left, y = e.clientY - b.top;
+  hideMenu();
+  drag = { x0: x, y0: y, pts: [[x, y]], add: e.shiftKey || e.ctrlKey };
+  if (tool === 'box') { drag.el = document.createElement('div'); drag.el.className = 'marquee'; overlay.appendChild(drag.el); }
+  else {
+    drag.el = document.createElementNS(svgNS, 'svg'); drag.el.setAttribute('class', 'absolute inset-0 w-full h-full pointer-events-none');
+    drag.path = document.createElementNS(svgNS, 'path');
+    drag.path.setAttribute('fill', 'rgba(124,92,255,.18)'); drag.path.setAttribute('stroke', '#7c5cff'); drag.path.setAttribute('stroke-width', '2.5');
+    drag.el.appendChild(drag.path); overlay.appendChild(drag.el);
+  }
+  overlay.setPointerCapture(e.pointerId);
 });
 overlay.addEventListener('pointermove', (e) => {
   if (!drag) return;
   const b = overlay.getBoundingClientRect(), x = e.clientX - b.left, y = e.clientY - b.top;
-  Object.assign(drag.el.style, { left: Math.min(x, drag.x0) + 'px', top: Math.min(y, drag.y0) + 'px', width: Math.abs(x - drag.x0) + 'px', height: Math.abs(y - drag.y0) + 'px' });
+  if (tool === 'box') Object.assign(drag.el.style, { left: Math.min(x, drag.x0) + 'px', top: Math.min(y, drag.y0) + 'px', width: Math.abs(x - drag.x0) + 'px', height: Math.abs(y - drag.y0) + 'px' });
+  else { drag.pts.push([x, y]); drag.path.setAttribute('d', 'M' + drag.pts.map((p) => p.join(',')).join('L') + 'Z'); }
   drag.x1 = x; drag.y1 = y;
 });
 overlay.addEventListener('pointerup', async () => {
   if (!drag) return;
   const d = drag; drag = null; d.el.remove();
-  let r = { x: Math.min(d.x0, d.x1 ?? d.x0), y: Math.min(d.y0, d.y1 ?? d.y0), w: Math.abs((d.x1 ?? d.x0) - d.x0), h: Math.abs((d.y1 ?? d.y0) - d.y0) };
-  if (r.w < 12 || r.h < 12) r = { x: d.x0 - 70, y: d.y0 - 70, w: 140, h: 140 };
-  if (!d.add) { selections.forEach((s) => s.box?.remove()); selections = []; }
-  await addSelection(r);
+  let poly = null, r;
+  if (tool === 'lasso' && d.pts.length > 6) {
+    poly = d.pts;
+    const xs = poly.map((p) => p[0]), ys = poly.map((p) => p[1]);
+    r = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
+  } else r = { x: Math.min(d.x0, d.x1 ?? d.x0), y: Math.min(d.y0, d.y1 ?? d.y0), w: Math.abs((d.x1 ?? d.x0) - d.x0), h: Math.abs((d.y1 ?? d.y0) - d.y0) };
+  if (r.w < 14 || r.h < 14) { r = { x: d.x0 - 70, y: d.y0 - 70, w: 140, h: 140 }; poly = null; }
+  if (!d.add) clearSelections(true);
+  await makeSelection(r, poly);
 });
 function cropOf(img, r, max = 640) {
   const k = img.naturalWidth / iframe.clientWidth, c = document.createElement('canvas');
@@ -381,30 +449,79 @@ function cropOf(img, r, max = 640) {
   c.getContext('2d').drawImage(img, r.x * k, r.y * k, r.w * k, r.h * k, 0, 0, c.width, c.height);
   return c.toDataURL('image/jpeg', 0.88);
 }
-async function addSelection(r) {
-  const box = screenBox(r, 'Looking…');
-  const [uri, world] = await Promise.all([grabFrame(), worldFromRect(r)]);
-  const img = new Image(); img.src = uri; await img.decode();
-  const sel = { id: 's' + Date.now(), rect: r, world, box, crop: cropOf(img, r), full: cropOf(img, { x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, 1000),
-    label: 'Selection', roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null,
-    pose: { sweep: poseCache.sweep, rot: { ...poseCache.rotation } } };
+// Freeze everything a later render needs: frame, pose, 3D box, crop. Then pin a highlight in 3D and open the menu.
+async function makeSelection(r, poly = null, opts = {}) {
+  const pose = snapPose();
+  const outline = screenOutline(r, poly, opts.label || 'Selected');
+  const [frame, world] = await Promise.all([grabFrame(), worldFromRect(r)]);
+  const img = new Image(); img.src = frame; await img.decode();
+  const sel = { id: 's' + Date.now(), rect: r, poly, frame, pose, world, box: outline, crop: cropOf(img, r),
+    full: cropOf(img, { x: 0, y: 0, w: pose.W, h: pose.H }, 1000), item: opts.item || '', label: opts.label || 'Selection',
+    roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null };
+  if (world) sel.marker = await addNode('fd.planbox', { w: world.w, h: world.h, d: world.d, color: BOX_COLOR.pending, visible: true }, (n) => {
+    n.position.set(world.center.x, world.center.y, world.center.z); n.quaternion.setFromAxisAngle({ x: 0, y: 1, z: 0 }, world.yaw);
+  });
   selections.push(sel); renderSelChips();
-  analyze(sel);
+  if (!opts.silent) showMenu(sel);
+  return sel;
 }
-function screenBox(r, label) {
+function screenOutline(r, poly, label) {
   const el = document.createElement('div');
   el.className = 'sel-box pending';
   Object.assign(el.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
-  el.innerHTML = `<span class="sel-label">${label}</span>`;
+  if (poly) {
+    el.style.border = 'none'; el.style.background = 'none';
+    el.innerHTML = `<svg class="absolute inset-0 overflow-visible" width="${r.w}" height="${r.h}"><path d="M${poly.map(([x, y]) => `${x - r.x},${y - r.y}`).join('L')}Z" fill="rgba(124,92,255,.16)" stroke="#7c5cff" stroke-width="2.5" stroke-dasharray="7 5"/></svg>`;
+  }
+  el.insertAdjacentHTML('beforeend', `<span class="sel-label">${label}</span>`);
   overlay.appendChild(el); return el;
+}
+function clearSelections(keepMarkers = false) {
+  for (const s of selections) { s.box?.remove(); if (!keepMarkers && s.marker) { s.marker.stop(); s.marker = null; } }
+  if (keepMarkers) for (const s of selections) if (s.marker) { s.marker.stop(); s.marker = null; }
+  selections = []; renderSelChips(); hideMenu();
 }
 function renderSelChips() {
   $('#sel-chips').innerHTML = selections.map((s) => `<span class="inline-flex items-center gap-1.5 text-xs font-medium bg-brand-50 text-brand-700 rounded-full pl-1 pr-1 py-1">
     <img src="${s.crop}" class="w-6 h-6 rounded-full object-cover">${s.label}<button data-x="${s.id}" class="w-5 h-5 rounded-full hover:bg-brand-100" aria-label="Remove selection">✕</button></span>`).join('');
   $('#sel-chips').querySelectorAll('[data-x]').forEach((b) => b.onclick = () => {
-    const s = selections.find((x) => x.id === b.dataset.x); s?.box?.remove();
-    selections = selections.filter((x) => x.id !== b.dataset.x); renderSelChips();
+    const s = selections.find((x) => x.id === b.dataset.x); s?.box?.remove(); s?.marker?.stop();
+    selections = selections.filter((x) => x.id !== b.dataset.x); renderSelChips(); hideMenu();
   });
+}
+
+/* the floating action menu next to a selection (tap-and-hold style) */
+function hideMenu() { $('#sel-menu')?.remove(); }
+function showMenu(sel) {
+  hideMenu();
+  const m = document.createElement('div');
+  m.id = 'sel-menu';
+  m.className = 'absolute z-40 w-64 bg-white/95 backdrop-blur rounded-2xl shadow-2xl ring-1 ring-black/5 overflow-hidden text-[15px] text-ink';
+  const left = Math.min(overlay.clientWidth - 270, Math.max(8, sel.rect.x + sel.rect.w + 10));
+  const top = Math.min(overlay.clientHeight - 300, Math.max(8, sel.rect.y));
+  Object.assign(m.style, { left: left + 'px', top: top + 'px' });
+  const row = (k, label, icon) => `<button data-act="${k}" class="w-full flex items-center justify-between px-4 py-2.5 hover:bg-slate-100 border-t border-slate-100">${label}<span class="text-slate-400">${icon}</span></button>`;
+  m.innerHTML = `<div class="flex items-center gap-2 px-3 py-2 bg-slate-50"><img src="${sel.crop}" class="w-8 h-8 rounded-md object-cover"><span class="font-semibold text-sm truncate" data-label>${sel.label}</span>
+      <button data-act="close" class="ml-auto text-slate-400 hover:text-ink" aria-label="Close menu">✕</button></div>
+    ${row('remove', 'Remove it', '🗑')}${row('replace', 'Replace with…', '⇄')}${row('add', 'Add here…', '＋')}${row('suggest', 'What would help here?', '✦')}
+    <form data-say class="hidden border-t border-slate-100 p-2 flex gap-1.5"><input class="flex-1 min-w-0 text-sm border rounded-lg px-2 py-1.5 outline-none focus:border-brand-500"><button class="text-sm font-semibold bg-brand-600 text-white rounded-lg px-3">Go</button></form>
+    <form data-free class="border-t border-slate-100 p-2 flex gap-1.5"><input class="flex-1 min-w-0 text-sm border rounded-lg px-2 py-1.5 outline-none focus:border-brand-500" placeholder="Or tell the agent…"><button class="text-sm font-semibold bg-ink text-white rounded-lg px-3">↵</button></form>`;
+  overlay.appendChild(m);
+  let pending = null;
+  const say = m.querySelector('[data-say]'), sayIn = say.querySelector('input');
+  m.querySelectorAll('[data-act]').forEach((b) => b.onclick = () => {
+    const a = b.dataset.act;
+    if (a === 'close') return hideMenu();
+    if (a === 'remove') return command(sel, 'Remove this completely', `Remove ${sel.item || 'it'}`);
+    if (a === 'suggest') { hideMenu(); return analyze(sel); }
+    pending = a; say.classList.remove('hidden');
+    sayIn.placeholder = a === 'replace' ? 'e.g. a curbless walk-in shower with a seat' : 'e.g. grab bars, a ramp, a bench';
+    sayIn.focus();
+  });
+  say.onsubmit = (ev) => { ev.preventDefault(); const t = sayIn.value.trim(); if (!t) return;
+    command(sel, pending === 'replace' ? `Replace this with: ${t}` : `Add here: ${t}`, `${pending === 'replace' ? 'Replace with' : 'Add'} ${t}`); };
+  m.querySelector('[data-free]').onsubmit = (ev) => { ev.preventDefault(); const t = ev.currentTarget.querySelector('input').value.trim(); if (t) command(sel, t, t); };
+  // label the selection once the agent knows what it is (cheap: reuse the analyze endpoint lazily only on demand)
 }
 
 /* ---------------- chat + change cards with priced product options ---------------- */
@@ -488,7 +605,6 @@ $('#chat-form').addEventListener('submit', async (ev) => {
 const CHANGE_RE = /(make|turn|change|replace|remove|add|convert|swap|put|install|get rid|widen|lower|raise|build|design|walk-?in|ramp|grab bar|stairlift|seat|door)/i;
 async function findInView(msg) {
   const t = thinking('Finding that in your view');
-  const pose = { sweep: poseCache.sweep, rot: { ...poseCache.rotation } };
   const image = await grabFrame();
   const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ views: [{ image, room: currentRoom()?.label || '' }], needs: NEEDS, instruction: msg,
@@ -498,10 +614,8 @@ async function findInView(msg) {
   if (!f?.box_2d) { bubble(`I couldn't spot that in this view. Turn toward it, or click <b>Select to change</b> and drag a box around it.`); return; }
   const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d;
   const rect = { x: b[1] / 1000 * W, y: b[0] / 1000 * Hh, w: (b[3] - b[1]) / 1000 * W, h: (b[2] - b[0]) / 1000 * Hh };
-  const img = new Image(); img.src = image; await img.decode();
-  const sel = { id: 's' + Date.now(), rect, world: await worldFromRect(rect), box: screenBox(rect, f.item || 'Found'), crop: cropOf(img, rect),
-    item: f.item, label: f.item || 'Selection', roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null, pose };
-  selections = [sel]; renderSelChips();
+  clearSelections();
+  const sel = await makeSelection(rect, null, { item: f.item, label: f.item || 'Found', silent: true });
   bubble(`<div class="flex gap-3 items-start"><img src="${sel.crop}" class="w-12 h-12 rounded-lg object-cover shrink-0">
     <div class="text-sm"><div class="font-semibold">${f.item || ''}</div><div class="text-slate-600">${f.issue || ''}</div></div></div>${changeCard(sel, f)}`);
 }
@@ -559,9 +673,10 @@ async function runAgent() {
     await lookAt(views[f.view]?.rot || views[0].rot); await sleep(700);
     const W = iframe.clientWidth, Hh = iframe.clientHeight, b = f.box_2d || [300, 300, 700, 700];
     const rect = { x: b[1] / 1000 * W, y: b[0] / 1000 * Hh, w: (b[3] - b[1]) / 1000 * W, h: (b[2] - b[0]) / 1000 * Hh };
-    const world = await worldFromRect(rect);
+    const sel = await makeSelection(rect, null, { item: f.item, label: f.item, silent: true });
+    selections = selections.filter((x) => x !== sel); renderSelChips();
     const opt = (f.options || [])[1] || (f.options || [])[0];
-    const { meta } = await applyChange({ rect, world, item: f.item, roomLabel: room.label, roomId: room.id }, f, opt, '', true);
+    const { meta } = await applyChange(sel, f, opt, '', true);
     found += meta ? 1 : 0;
     li.innerHTML = meta ? `✅ ${room.label}: <b>${f.title}</b>, ${opt?.name || ''} (${money(opt?.total)})${compareHtml(meta.id)}` : `⚠️ ${room.label}: couldn't render ${f.title}`;
   }
@@ -576,7 +691,10 @@ $('#agent-run').onclick = () => startAgent();
 function save() { try { localStorage.setItem(STORE, JSON.stringify(edits)); } catch {} }
 async function restoreEdits() {
   try { edits = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch { edits = []; }
-  for (const e of edits) { await mountBox(e); for (const p of e.patches) await mountPatch(e, p); }
+  for (const e of edits) {
+    if (e.status === 'analyzing' || e.status === 'rendering') { e.status = e.patches.length ? 'done' : 'failed'; e.error = e.error || 'interrupted by a page reload'; }
+    await mountBox(e); for (const p of e.patches) await mountPatch(e, p);
+  }
   refreshVisibility(); renderPlan();
 }
 function removeEdit(id) {
@@ -588,23 +706,31 @@ function swapOption(id, i) {     // a different product: drop old renders, re-re
   const e = edits.find((x) => x.id === id); if (!e || !e.options[i]) return;
   e.option = e.options[i]; e.cost = e.option.total; e.ref = null;
   const L = live[id]; Object.values(L?.patches || {}).forEach((n) => n.stop()); if (L) L.patches = {};
-  e.patches = []; save(); renderPlan(); renderMissingViews();
+  e.patches = []; save(); renderPlan();
+  const sel = selFor.get(id);
+  if (sel) runRender(e, sel); else renderMissingViews();   // re-render from the original view if we still have it
 }
 function renderPlan() {
   const on = edits.filter((e) => e.on !== false);
   const total = on.reduce((s, e) => s + (e.cost || 0), 0), labor = on.reduce((s, e) => s + (e.option?.labor || 0), 0);
   $('#plan-count').textContent = edits.length;
-  $('#plan').innerHTML = edits.map((e) => `<li class="border border-slate-100 rounded-xl p-3 ${e.on === false ? 'opacity-50' : ''}">
-    <div class="flex items-start gap-2">
-      <input type="checkbox" data-on="${e.id}" ${e.on !== false ? 'checked' : ''} class="mt-1 accent-brand-600" aria-label="Include this change">
-      <div class="flex-1 min-w-0"><div class="font-medium">${e.title}${e.agent ? ' <span class="text-[10px] bg-brand-100 text-brand-700 rounded px-1 align-middle">agent</span>' : ''}</div>
-        <div class="text-xs text-slate-500">${e.room || ''}${e.custom ? ` · “${e.custom}”` : ''}</div>
-        ${e.option ? `<div class="text-xs text-slate-500">Item ${money(e.option.material)} · labor ${money(e.option.labor)} (${e.option.labor_hours} h)</div>` : ''}
-        ${e.options?.length > 1 ? `<select data-swap="${e.id}" class="mt-1 max-w-full text-xs border rounded px-1 py-0.5">${e.options.map((o, i) => `<option value="${i}" ${o.name === e.option?.name ? 'selected' : ''}>${o.tier}: ${o.name} (${money(o.total)})</option>`).join('')}</select>` : ''}
-      </div>
-      <div class="text-right shrink-0"><div class="font-semibold">${money(e.cost)}</div>
-        <button data-go="${e.id}" class="text-xs text-brand-700 font-semibold">View</button>
-        <button data-del="${e.id}" class="text-xs text-slate-400 hover:text-red-600 ml-1" aria-label="Delete change">✕</button></div></div></li>`).join('')
+  const pill = (e) => ({ analyzing: '<span class="text-[11px] font-semibold text-brand-700 bg-brand-50 rounded-full px-2 py-0.5 animate-pulse">Thinking…</span>',
+    rendering: '<span class="text-[11px] font-semibold text-amber-700 bg-amber-50 rounded-full px-2 py-0.5 animate-pulse">Rendering…</span>',
+    failed: `<span class="text-[11px] font-semibold text-red-700 bg-red-50 rounded-full px-2 py-0.5" title="${(e.error || '').replace(/"/g, '')}">Failed</span>`,
+  })[e.status] || '<span class="text-[11px] font-semibold text-emerald-700 bg-emerald-50 rounded-full px-2 py-0.5">Ready</span>';
+  $('#plan').innerHTML = [...edits].reverse().map((e) => `<li class="border border-slate-100 rounded-xl p-2.5 ${e.on === false ? 'opacity-50' : ''}">
+    <div class="flex items-start gap-2.5">
+      <button data-go="${e.id}" class="shrink-0 w-16 h-16 rounded-lg overflow-hidden bg-slate-100" title="Show it in the tour">
+        <img src="${e.thumb ? `/api/home/${H.id}/render/${e.thumb}/patch` : (e.crop || '')}" class="w-full h-full object-cover" alt=""></button>
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-1.5">${pill(e)}${e.agent ? '<span class="text-[10px] bg-brand-100 text-brand-700 rounded px-1">agent</span>' : ''}<span class="ml-auto font-semibold text-sm">${e.cost ? money(e.cost) : ''}</span></div>
+        <div class="font-medium text-sm leading-tight mt-0.5">${e.title}</div>
+        <div class="text-xs text-slate-500">${e.room || ''}${e.option ? ` · item ${money(e.option.material)} + labor ${money(e.option.labor)}` : ''}</div>
+        ${e.options?.length > 1 && e.status === 'done' ? `<select data-swap="${e.id}" class="mt-1 max-w-full text-xs border rounded px-1 py-0.5">${e.options.map((o, i) => `<option value="${i}" ${o.name === e.option?.name ? 'selected' : ''}>${o.tier}: ${o.name} (${money(o.total)})</option>`).join('')}</select>` : ''}
+        <div class="mt-1 flex items-center gap-3 text-xs">
+          <label class="flex items-center gap-1 text-slate-500"><input type="checkbox" data-on="${e.id}" ${e.on !== false ? 'checked' : ''} class="accent-brand-600">Include</label>
+          <button data-go="${e.id}" class="text-brand-700 font-semibold">View</button>
+          <button data-del="${e.id}" class="text-slate-400 hover:text-red-600 ml-auto">Delete</button></div></div></div></li>`).join('')
     || '<li class="text-sm text-slate-500">No changes yet.</li>';
   $('#plan').querySelectorAll('[data-del]').forEach((b) => b.onclick = () => removeEdit(b.dataset.del));
   $('#plan').querySelectorAll('[data-go]').forEach((b) => b.onclick = () => flyTo(edits.find((e) => e.id === b.dataset.go)));
