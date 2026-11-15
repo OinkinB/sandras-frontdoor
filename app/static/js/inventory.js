@@ -157,7 +157,7 @@ async function originalPhoto(e) {
 }
 
 async function prepareCurrentAngle(force = false) {
-  if (coverageBusy || !sdk || !stationedSweep || poseCache?.sweep !== stationedSweep ||
+  if (coverageBusy || window.sandraShowcase?.playing || !sdk || !stationedSweep || poseCache?.sweep !== stationedSweep ||
     mode === 'select' || view !== 'after' || poseCache.mode !== 'mode.inside') return false;
   const sweep = sweepList.find((s) => s.id === stationedSweep);
   if (!sweep) return false;

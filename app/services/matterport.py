@@ -15,10 +15,17 @@ QUERY = """query($id: ID!) { model(id: $id) {
 }}"""
 
 
+def cached_info(model_id: str, cache_dir: Path) -> dict | None:
+    try:
+        return json.loads((cache_dir / f"mp_{model_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def model_info(model_id: str, cache_dir: Path) -> dict:
+    if (cached := cached_info(model_id, cache_dir)) is not None:
+        return cached
     f = cache_dir / f"mp_{model_id}.json"
-    if f.exists():
-        return json.loads(f.read_text())
     r = requests.post(API, json={"query": QUERY, "variables": {"id": model_id}}, timeout=60,
                       auth=(os.environ["MATTERPORT_API_KEY"], os.environ["MATTERPORT_API_TOKEN"]))
     r.raise_for_status()
@@ -51,5 +58,5 @@ def model_info(model_id: str, cache_dir: Path) -> dict:
                              "evidence": f"3D scan: {b['floor']} bathroom is {b['area_sqft']:.0f} sq ft (60 in turning circle needs ~5x5 ft clear)"})
     out = {"name": m.get("name"), "floors": floors, "rooms": rooms, "findings": findings,
            "sweeps": len(m.get("locations") or [])}
-    f.write_text(json.dumps(out))
+    f.write_text(json.dumps(out), encoding="utf-8")
     return out

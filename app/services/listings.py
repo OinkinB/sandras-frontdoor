@@ -17,7 +17,8 @@ NEEDS = {
     "no_stairs": "No interior stairs",
     "step_free_entry": "Step-free entry",
     "wide_doorways": "Wide doorways (36 in+)",
-    "walk_in_shower": "Walk-in / roll-in shower",
+    "walk_in_shower": "Walk-in shower",
+    "roll_in_shower": "Roll-in / curbless shower",
     "grab_bars": "Grab bars",
     "first_floor_bedroom": "Bedroom + bath on main floor",
     "smooth_flooring": "Smooth hard flooring",
@@ -30,6 +31,8 @@ NEEDS = {
 
 # (need, status, regex) checked against remarks + feature lines, first match wins per need.
 RULES = [
+    ("roll_in_shower", "yes", r"roll[- ]in shower|curbless shower|zero[- ]threshold shower|barrier[- ]free shower"),
+    ("roll_in_shower", "no", r"tub/shower combo|shower over tub|raised shower curb"),
     ("walk_in_shower", "yes", r"(walk|roll)[- ]in shower|curbless|zero[- ]threshold shower|barrier[- ]free shower"),
     ("walk_in_shower", "no", r"bathtub with shower|tub/shower|shower over tub|garden tub"),
     ("grab_bars", "yes", r"grab bars?"),
@@ -99,8 +102,6 @@ def extract(text: str, stories, condo: bool, has_elevator: bool) -> dict:
             ev["no_stairs"] = {"status": "likely", "evidence": f"Condo in elevator building ({stories} stories)"}
         else:
             ev["no_stairs"] = {"status": "no", "evidence": f"{stories}-story home"}
-    if stories == 1 and ev["step_free_entry"]["status"] == "unknown":
-        ev["step_free_entry"] = {"status": "likely", "evidence": "Single-story, slab homes often have 0-1 entry steps"}
     return ev
 
 

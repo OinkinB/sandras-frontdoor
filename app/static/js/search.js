@@ -37,7 +37,7 @@ function card(h) {
   const hard = (state.filters.required || []).length;
   const supported = state.filters.needs.filter((n) => h.evidence[n]?.status === 'yes' && !state.filters.required.includes(n));
   const evidence = pending ? unconfirmed.map((n) => state.labels[n]).join(', ') + ' · confirm in the scan' :
-    hard ? 'Must-haves supported by listing' : '';
+    hard ? 'Must-haves supported by listing or scan' : '';
   const priced = h.mods.length ? 'Estimated changes ' + money(h.mod_total) : '';
   const photos = /^https?:\/\//i.test(h.photo || '') ? '<img src="' + safe(h.photo) + '" alt="" loading="lazy" class="w-full h-full object-cover">' : '';
   const params = new URLSearchParams({ needs: state.filters.needs.join(','), required: state.filters.required.join(',') });
@@ -72,40 +72,79 @@ function renderGrid() {
   }
 }
 
+function showResults(data, q) {
+  state = { filters: data.filters, results: data.results, labels: data.need_labels };
+  try {
+    sessionStorage.setItem('fd-persona', data.filters.persona || '');
+    sessionStorage.setItem('fd-budget', data.filters.max_price || '');
+    if (q) sessionStorage.setItem('fd-search-query', q);
+  } catch {}
+  const labels = data.filters.required.map((n) => data.need_labels[n]);
+  $('#result-sub').textContent = data.count.toLocaleString() + ' homes with 3D tours' +
+    (labels.length ? ' · ' + (data.confirmed_count ?? 0).toLocaleString() + ' with all must-haves documented' : '');
+  renderChips();
+  renderGrid();
+}
+
+let searchRequest = null, loadedResults = false;
+async function fetchSearch(body, signal) {
+  const response = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), signal });
+  if (!response.ok) throw new Error('Search failed');
+  return response.json();
+}
+function searchBusy(busy, message) {
+  $('#persona').textContent = message;
+  $('#search-progress').hidden = !busy;
+  if (busy) $('#grid').setAttribute('aria-busy', 'true');
+  else $('#grid').removeAttribute('aria-busy');
+}
 async function run(q, filters) {
   const version = ++requestVersion;
-  $('#persona').textContent = q ? 'Sandra is checking your must-haves…' : '';
-  $('#grid').setAttribute('aria-busy', 'true');
+  searchRequest?.abort();
+  const controller = searchRequest = new AbortController();
+  const { signal } = controller;
+  searchBusy(true, 'Sandra is finding matching homes…');
+  if (!loadedResults) {
+    $('#grid').innerHTML = '<div class="search-skeleton" aria-hidden="true"></div>'.repeat(4);
+  }
+  let quickShown = false;
   try {
-    const body = filters ? { filters } : { q, rent };
-    const response = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!response.ok) throw new Error('Search failed');
-    const data = await response.json();
+    const body = filters ? { filters } : { q, rent, quick: true };
+    const initial = await fetchSearch(body, signal);
     if (version !== requestVersion) return;
-    state = { filters: data.filters, results: data.results, labels: data.need_labels };
-    try {
-      sessionStorage.setItem('fd-persona', data.filters.persona || '');
-      sessionStorage.setItem('fd-budget', data.filters.max_price || '');
-      if (q) sessionStorage.setItem('fd-search-query', q);
-    } catch {}
-    $('#persona').textContent = q ? data.filters.summary || '' : '';
-    const labels = data.filters.required.map((n) => data.need_labels[n]);
-    $('#result-sub').textContent = data.count.toLocaleString() + ' homes with 3D tours' +
-      (labels.length ? ' · Must-haves: ' + labels.join(', ') : '');
-    renderChips();
-    renderGrid();
-  } catch (err) {
-    if (version === requestVersion) $('#persona').textContent = 'Sandra could not load the search. Try again.';
-  } finally {
-    if (version === requestVersion) $('#grid').removeAttribute('aria-busy');
+    showResults(initial, q);
+    loadedResults = true;
+    quickShown = true;
+    if (q && !filters) {
+      searchBusy(true, 'Matches are ready. Sandra is checking the details of your request…');
+      const timeout = setTimeout(() => controller.abort(), 8500);
+      try {
+        const refined = await fetchSearch({ q, rent }, signal);
+        if (version !== requestVersion) return;
+        showResults(refined, q);
+        searchBusy(false, refined.filters.summary || '');
+      } finally { clearTimeout(timeout); }
+    } else searchBusy(false, '');
+  } catch {
+    if (version !== requestVersion) return;
+    searchBusy(false, quickShown ? 'Showing matches from your explicit search terms.' : 'Sandra could not load this search. Submit again to retry.');
+    if (!loadedResults) $('#grid').replaceChildren();
   }
 }
 const query = $('#q');
-const openWorld = () => document.body.classList.add('opened');   // the blank slate opens up on the first answer
-$('#search-form').addEventListener('submit', (e) => { e.preventDefault(); if (!query.value.trim()) return; openWorld(); run(query.value.trim()); });
-query.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!query.value.trim()) return; openWorld(); run(query.value.trim()); }
+function openWorld() {
+  document.body.classList.add('opened');
+  $('#results').inert = false;
+}
+$('#search-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = query.value.trim();
+  if (!text) { query.focus(); return; }
+  openWorld();
+  run(text);
 });
+
 $('#sort').addEventListener('change', renderGrid);
 $('#required-mode').onclick = (e) => {
   markRequired = !markRequired;
@@ -113,7 +152,7 @@ $('#required-mode').onclick = (e) => {
   e.currentTarget.textContent = markRequired ? 'Done marking must-haves' : 'Mark must-haves';
   if (markRequired) $('#persona').textContent = 'Choose any access preference the home must already have.';
 };
-document.querySelectorAll('[data-example]').forEach((b) => { b.onclick = () => { query.value = b.dataset.example; query.focus(); }; });
+document.querySelectorAll('[data-example]').forEach((b) => { b.onclick = () => { query.value = b.dataset.example; query.focus(); query.setSelectionRange(0, 0); }; });
 try {
   if (performance.getEntriesByType('navigation')[0]?.type === 'back_forward') query.value = sessionStorage.getItem('fd-search-query') || '';
 } catch {}

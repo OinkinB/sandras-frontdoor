@@ -43,4 +43,16 @@ def create_app() -> Flask:
     app.register_blueprint(api_bp, url_prefix="/api")
     app.register_blueprint(bundle_bp, url_prefix="/bundle")
     app.register_blueprint(feedback_bp, url_prefix="/api")
+    if os.environ.get("GCP_PROJECT") and not app.testing:
+        # Fetch the Google Cloud token now, in the background, so the first search or AI call isn't slow.
+        import threading
+        from .services import ai
+        threading.Thread(target=lambda: _quiet(ai._access_token), daemon=True).start()
     return app
+
+
+def _quiet(fn):
+    try:
+        fn()
+    except Exception:
+        pass

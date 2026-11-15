@@ -1,15 +1,9 @@
-/* Empty rooms: Sandra clears out furniture and belongings the moment you arrive, without being asked.
-   Each scan point's 360 panorama is de-furnished by the image model (walls, windows, floors, built-ins stay
-   pixel-aligned, so the room's real dimensions are untouched), cached on the server, and wrapped on a sphere
-   centered on that scan point. A toggle brings the furniture back for comparison. */
+/* Optional defurnished preview for one original Matterport scan position. */
 (function () {
   const HID = window.HOME.id;
-  const KEY = `fd-empty-${HID}`;
   const st = {
-    on: (() => { try { return localStorage.getItem(KEY) !== 'off'; } catch { return true; } })(),
-    spheres: {},      // sweep -> { comp, center }
-    pending: {},      // sweep -> promise
-    failed: {},
+    preview: null,
+    spheres: {},
     // Matterport's equirectangular is centered on the camera heading at capture time; the sphere turns by that
     // heading plus a fixed offset (calibrated in the live tour by matching the sphere against the real view).
     sign: 1, offset: -90,
@@ -44,37 +38,51 @@
     this.onDestroy = function () { this.mesh.geometry.dispose(); this.mat.map?.dispose(); this.mat.dispose(); };
   }
 
-  const atSweep = (id) => poseCache && poseCache.mode === 'mode.inside' && poseCache.sweep === id;
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  function setVisible(id, v) {
-    const s = st.spheres[id];
-    if (!s || s.comp.component.inputs.visible === v) return;
-    s.comp.component.inputs.visible = v;
-  }
-  function hideAll(except) { for (const id in st.spheres) if (id !== except) setVisible(id, false); }
-
-  const sphereYaw = (captureYaw) => (st.sign * captureYaw + st.offset) * Math.PI / 180;
-  async function mount(id, center, captureYaw) {
-    if (st.spheres[id]) return st.spheres[id];
-    const comp = await addNode('fd.empty', { url: `/api/home/${HID}/empty/${id}`, center, yaw: sphereYaw(captureYaw), visible: false });
-    return (st.spheres[id] = { comp, center, captureYaw });
+function current(preview) {
+    return st.preview === preview && stationedSweep === preview.sweep && samePosition(preview.pose, poseCache);
   }
 
-  // Grab the real (furnished) panorama: our spheres and Sandra must be out of the shot.
-  async function capture() {
-    hideAll(null);
-    // `rover` is a top-level let in sandra-rover.js: classic scripts share that scope (it is not on window)
-    const model = (typeof rover !== 'undefined' && rover) ? rover.component?.model : null, was = model?.visible;
-    if (model) model.visible = false;
-    await wait(800);   // let the fade finish
-    try {
-      for (let k = 0; k < 3; k++) {   // the panorama is centered on the heading: retake if the camera turned meanwhile
-        const yaw = poseCache.rotation.y, image = await sdk.Renderer.takeEquirectangular();
-        if (Math.abs(((poseCache.rotation.y - yaw + 540) % 360) - 180) < 0.5 || k === 2) return { image, yaw };
-        await wait(400);
-      }
+  function hideSphere(sphere) {
+    const component = sphere.comp.component;
+    component.inputs.visible = false;
+    component.mat.opacity = 0;
+    component.outputs.objectRoot.visible = false;
+  }
+
+  async function mount(preview, yaw) {
+    const id = preview.sweep;
+    if (!st.spheres[id]) {
+      const rotation = (st.sign * yaw + st.offset) * Math.PI / 180;
+      const node = await addNode('fd.empty', {
+        url: '/api/home/' + HID + '/empty/' + id, center: preview.pose.position, yaw: rotation, visible: false,
+      });
+      st.spheres[id] = { comp: node, captureYaw: yaw };
     }
-    finally { if (model) model.visible = was; }
+    return st.spheres[id];
+  }
+
+  async function capture(preview) {
+    if (!current(preview) || capturingOriginal) return null;
+    const model = rover?.component?.model, shown = model?.visible;
+    capturingOriginal = true;
+    refreshVisibility();
+    if (model) model.visible = false;
+    try {
+      // Let the scene apply the visibility changes before capturing the original view.
+      await sleep(100);
+      for (let attempt = 0; attempt < 2 && current(preview); attempt++) {
+        const frame = snapPose();
+        const image = await soon(sdk.Renderer.takeEquirectangular(), 7000);
+        if (image && current(preview) && sameFrame(frame, snapPose())) {
+          return { image, yaw: frame.rotation.y, sweep: preview.sweep, model: window.HOME.matterport_id };
+        }
+      }
+      return null;
+    } finally {
+      if (model) model.visible = shown && poseCache?.mode === 'mode.inside';
+      capturingOriginal = false;
+      refreshVisibility();
+    }
   }
 
   function status(text, busy) {
@@ -84,40 +92,60 @@
     el.classList.toggle('busy', !!busy);
   }
 
-  async function arrive(id) {
-    if (!st.on || !id) return;
-    await wait(450);                      // let the move settle
-    if (!atSweep(id)) return;
-    hideAll(id);
-    const center = { ...poseCache.position };
-    if (st.spheres[id]) { setVisible(id, true); status('Empty room', false); return; }
-    if (st.failed[id] || st.pending[id]) return;
-    st.pending[id] = (async () => {
-      try {
-        const head = await fetch(`/api/home/${HID}/empty/${id}?meta=1`, { cache: 'no-store' });   // made already?
-        let ok = head.ok, yaw = ok ? +((await head.json()).yaw || 0) : 0;
-        if (!ok) {
-          status('Clearing furniture…', true);
-          if (typeof roverSay === 'function') roverSay('Clearing this room so you can see the space.', 4500);
-          const shot = await capture(); yaw = shot.yaw;
-          const r = await fetch(`/api/home/${HID}/empty/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(shot) });
-          ok = r.ok;
-          if (!ok) { st.failed[id] = true; status('Could not clear this room', false); return; }
-        }
-        await mount(id, center, yaw);
-        if (st.on && atSweep(id)) { setVisible(id, true); status('Empty room', false); }
-      } catch (e) { console.warn('empty room', e); st.failed[id] = true; status('Could not clear this room', false); }
-      finally { delete st.pending[id]; }
-    })();
+  function setButton(on) {
+    const button = document.getElementById('empty-toggle');
+    if (!button) return;
+    button.setAttribute('aria-pressed', String(on));
+    button.textContent = on ? 'Show original' : 'Preview empty here';
   }
 
-  function toggle(on) {
-    st.on = on;
-    try { localStorage.setItem(KEY, on ? 'on' : 'off'); } catch {}
-    const btn = document.getElementById('empty-toggle');
-    btn.setAttribute('aria-pressed', String(on));
-    btn.textContent = on ? 'Show furnished' : 'Empty the rooms';
-    if (on) arrive(poseCache?.sweep); else { hideAll(null); status('Furnished (as listed)', false); }
+  function leave() {
+    st.preview?.controller.abort();
+    st.preview = null;
+    Object.values(st.spheres).forEach(hideSphere);
+    setButton(false);
+    status('Original scan', false);
+  }
+
+  async function loadPreview() {
+    if (!stationedSweep || poseCache?.sweep !== stationedSweep || poseCache.mode !== 'mode.inside') {
+      status('Stop at a scan point first', false);
+      return;
+    }
+    const preview = { sweep: stationedSweep, pose: snapPose(), controller: new AbortController() };
+    st.preview = preview;
+    setButton(true);
+    status('Checking this view…', true);
+    const endpoint = '/api/home/' + HID + '/empty/' + preview.sweep;
+    const { signal } = preview.controller;
+    try {
+      let metadata = await fetch(endpoint + '?meta=1', { cache: 'no-store', signal });
+      if (!current(preview)) return;
+      if (metadata.status === 404) {
+        status('Preparing this view…', true);
+        const shot = await capture(preview);
+        if (!current(preview)) return;
+        if (!shot) throw new Error('The view changed before capture.');
+        const saved = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(shot), signal });
+        if (!saved.ok) {
+          const result = await saved.json().catch(() => ({}));
+          throw new Error(result.error || 'Could not create the preview.');
+        }
+        metadata = await fetch(endpoint + '?meta=1', { cache: 'no-store', signal });
+      }
+      if (!metadata.ok) throw new Error('The preview is unavailable.');
+      const data = await metadata.json();
+      if (!current(preview)) return;
+      const sphere = await mount(preview, +data.yaw || 0);
+      if (!current(preview)) return;
+      sphere.comp.component.inputs.visible = true;
+      status('AI preview · this view', false);
+    } catch (err) {
+      if (!current(preview)) return;
+      leave();
+      status(err.message || 'Could not preview this view', false);
+    }
   }
 
   function ui() {
@@ -126,7 +154,7 @@
     const box = document.createElement('div');
     box.id = 'empty-status';
     box.className = row ? 'tl-pill' : '';
-    box.innerHTML = '<span class="dot"></span><span class="txt">Empty room</span><button id="empty-toggle" type="button"></button>';
+    box.innerHTML = '<span class="dot"></span><span class="txt" role="status">Original scan</span><button id="empty-toggle" type="button"></button>';
     (row || document.getElementById('showcase').parentElement).appendChild(box);
     const css = document.createElement('style');
     css.textContent = `#empty-status{gap:.45rem;padding-right:4px}
@@ -136,15 +164,19 @@
       #empty-toggle{background:#0a0a0a;color:#fff;border-radius:999px;padding:.15rem .65rem;font-weight:600;font-size:.75rem;height:24px}
       @media (prefers-reduced-motion: reduce){#empty-status.busy .dot{animation:none}}`;
     document.head.appendChild(css);
-    document.getElementById('empty-toggle').onclick = () => toggle(!st.on);
-    toggle(st.on);
+    document.getElementById('empty-toggle').onclick = async () => {
+      if (st.preview) { leave(); return; }
+      await window.sandraShowcase?.takeControl();
+      if (!st.preview) loadPreview();
+    };
+    leave();
   }
 
   /* Calibration helper (dev): compare the sphere with the real view to find the yaw that lines them up. */
   window.emptyRoom = {
     state: st,
     calibrate(sign, offset) { st.sign = sign; st.offset = offset; for (const id in st.spheres) st.spheres[id].comp.component.inputs.yaw = sphereYaw(st.spheres[id].captureYaw); },
-    arrive, toggle,
+    leave,
   };
 
   // start once the tour (tour.js) has connected the SDK
@@ -154,19 +186,11 @@
     clearInterval(boot);
     try { await sdk.Scene.register('fd.empty', () => new EmptySphere()); } catch (e) { console.warn(e); }
     ui();
-    sdk.Sweep.current.subscribe((s) => {
-      const id = s.id || s.sid || '';
-      if (!id) { hideAll(null); return; }
-      if (!atSweep(id)) hideAll(null);
-      arrive(id);
+    sdk.Sweep.current.subscribe((sweep) => {
+      if (st.preview && (sweep.id || sweep.sid) !== st.preview.sweep) leave();
     });
-    sdk.Mode.current.subscribe((m) => { if (m !== 'mode.inside') hideAll(null); });
-    // the moment the camera leaves a scan point (walking, flying out), its sphere must go: it is only true from there
-    sdk.Camera.pose.subscribe((p) => {
-      for (const id in st.spheres) {
-        const s = st.spheres[id], c = s.center, inp = s.comp.component.inputs;
-        if (inp.visible && Math.hypot(p.position.x - c.x, p.position.y - c.y, p.position.z - c.z) > 0.04) inp.visible = false;
-      }
+    sdk.Camera.pose.subscribe((pose) => {
+      if (st.preview && !samePosition(st.preview.pose, pose)) leave();
     });
   }, 400);
 })();

@@ -252,7 +252,7 @@ async function setRoverState(phase, room = null, sweep = null, rect = null) {
 let lastUserMove = Date.now();
 setInterval(async () => {
   if (!rover || !sdk || !poseCache || poseCache.mode !== 'mode.inside' || reducedRoverMotion.matches) return;
-  if (typeof agentBusy !== 'undefined' && agentBusy) return;
+  if ((typeof agentBusy !== 'undefined' && agentBusy) || window.sandraShowcase?.playing) return;
   if (Date.now() - lastUserMove < 1500) return;                  // let the camera settle first
   if (Math.random() < 0.45) return;                              // not constantly busy: pauses feel alive
   const puck = sweepList.find((s) => s.id === poseCache.sweep)?.puckPosition;

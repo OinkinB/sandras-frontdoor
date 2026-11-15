@@ -8,11 +8,13 @@
     <div class="slate-sandra" aria-hidden="true"><span class="eye"></span><span class="eye"></span><span class="cheek l"></span><span class="cheek r"></span></div>
     <div class="slate-kicker">Sandra</div>
     <h1>What do you need<br>in a home?</h1>
-    <form id="search-form" class="slate-input">
+    <form id="search-form" class="slate-input" role="search">
+      <span class="slate-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10.5" cy="10.5" r="6.25"/><path d="m15.3 15.3 5 5"/></svg></span>
       <label for="q" class="sr-only">Tell Sandra what you need in a home</label>
-      <textarea id="q" rows="1" placeholder="Single-level, step-free, near Houston, under $400k…"></textarea>
-      <button aria-label="Find homes">→</button>
+      <input id="q" name="q" type="search" enterkeyhint="search" autocomplete="off" maxlength="1000" placeholder="Single-level, step-free, Houston, under $400k…">
+      <button type="submit" aria-label="Find homes">→</button>
     </form>
+    <div id="search-progress" class="slate-progress" hidden aria-hidden="true"><span></span></div>
     <div class="slate-examples" aria-label="Examples">
       <button type="button" data-example="I use a wheelchair: step-free entry, wide doors and a roll-in shower in Houston under $400,000.">Wheelchair</button>
       <button type="button" data-example="Aging in place: bedroom and bath on the main floor, grab bars, no stairs, Houston.">Aging in place</button>
@@ -23,14 +25,14 @@
   </section>
 
   <!-- 2. The world opens up after you answer -->
-  <section class="slate-world" aria-live="polite">
+  <section class="slate-world" id="results" aria-labelledby="results-heading" inert>
     <img id="hero-img" alt="" class="hidden">
     <div class="slate-prefs">
       <div id="chips" class="flex flex-wrap gap-2"></div>
       <button type="button" id="required-mode" class="slate-ghost" aria-pressed="false">Mark must-haves</button>
     </div>
     <div class="flex flex-wrap items-end justify-between gap-4 mt-8">
-      <div><h2 class="slate-h2">Homes Sandra found for you</h2><p id="result-sub" role="status" class="text-sm"></p></div>
+      <div><h2 class="slate-h2" id="results-heading">Homes Sandra found for you</h2><p id="result-sub" role="status" class="text-sm"></p></div>
       <label class="text-sm slate-sort">Sort
         <select id="sort"><option value="match">Best fit</option><option value="true">Lowest total</option><option value="mods">Fewest changes</option></select></label>
     </div>
@@ -47,8 +49,8 @@
   body.slate-page .sandra-mark::before, body.slate-page .sandra-mark::after { background: #fff; box-shadow: none; }
   .slate { max-width: 1500px; margin: 0 auto; padding: 0 1.25rem 4rem; }
   .slate-hero { min-height: calc(100vh - 57px); display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
-    transition: min-height .8s cubic-bezier(.2,.8,.2,1), padding .8s; }
-  .slate-hero h1 { font-size: clamp(2.4rem, 6vw, 4.6rem); line-height: 1; letter-spacing: -.055em; font-weight: 700; margin: .6rem 0 2rem; transition: font-size .8s cubic-bezier(.2,.8,.2,1), margin .8s; }
+    transition: min-height .26s cubic-bezier(.2,.8,.2,1), padding .26s; }
+  .slate-hero h1 { font-size: clamp(2.4rem, 6vw, 4.6rem); line-height: 1; letter-spacing: -.055em; font-weight: 700; margin: .6rem 0 2rem; transition: font-size .26s cubic-bezier(.2,.8,.2,1), margin .26s; }
   .slate-kicker { font: 600 .72rem 'Space Mono', monospace; letter-spacing: .3em; text-transform: uppercase; color: #8a8a8a; }
   .slate-sandra { position: relative; width: 64px; height: 50px; border-radius: 22px 22px 18px 18px; background: #ff5fa2; margin-bottom: 1rem;
     box-shadow: 0 10px 30px -8px #ff5fa2aa; animation: sbob 3s ease-in-out infinite; }
@@ -60,17 +62,24 @@
   .slate-sandra .cheek.l { left: 9px; } .slate-sandra .cheek.r { right: 9px; }
   @keyframes sbob { 50% { transform: translateY(-5px) rotate(-3deg); } }
   @keyframes sblink { 0%, 92%, 100% { transform: scaleY(1); } 95% { transform: scaleY(.15); } }
-  .slate-input { display: flex; align-items: center; gap: .5rem; width: min(680px, 100%); border-bottom: 2px solid #0a0a0a; padding: .4rem 0; }
-  .slate-input textarea { flex: 1; resize: none; background: transparent; outline: none; font-size: clamp(1.05rem, 2vw, 1.35rem); color: #0a0a0a; line-height: 1.4; }
-  .slate-input textarea::placeholder { color: #b0b0b0; }
-  .slate-input button { width: 46px; height: 46px; border-radius: 50%; background: #0a0a0a; color: #fff; font-size: 1.3rem; flex: none; transition: transform .2s; }
-  .slate-input button:hover { transform: translateX(3px); }
+  .slate-input { display: flex; align-items: center; gap: .65rem; width: min(680px, 100%); border: 1px solid #dedede; border-radius: 999px; background: #fff; padding: .37rem .4rem .37rem 1rem; }
+  .slate-input:focus-within { border-color: #d8d8d8; box-shadow: 0 2px 12px #17171718; }
+  .slate-search-icon { flex: none; width: 20px; height: 20px; color: #747474; }
+  .slate-input input { flex: 1; width: 0; min-width: 0; height: 42px; background: transparent; padding: 0; border: 0; border-radius: 0; outline: none; font-size: clamp(1rem, 2vw, 1.22rem); color: #111; }
+  .slate-input input:focus-visible { outline: none; }
+  .slate-input input::placeholder { color: #757575; }
+  .slate-input input::-webkit-search-cancel-button { cursor: pointer; }
+  .slate-input button { width: 42px; height: 42px; border-radius: 50%; background: #0a0a0a; color: #fff; font-size: 1.25rem; flex: none; }
+  .slate-input button:hover { background: #333; }
+  .slate-progress { width: min(630px, 92%); height: 4px; border-radius: 8px; margin-top: .5rem; overflow: hidden; background: #f9d9e7; }
+  .slate-progress span { display: block; width: 38%; height: 100%; border-radius: 8px; background: #d52272; animation: search-progress 1.15s ease-in-out infinite; }
+  @keyframes search-progress { from { transform: translateX(-110%); } to { transform: translateX(380%); } }
   .slate-examples { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: center; margin-top: 1.4rem; }
   .slate-examples button, .slate-ghost { border: 1px solid #dcdcdc; color: #4a4a4a; border-radius: 999px; padding: .38rem .9rem; font-size: .85rem; background: transparent; }
   .slate-examples button:hover, .slate-ghost:hover { border-color: #0a0a0a; color: #0a0a0a; }
   #persona { margin-top: 1rem; min-height: 1.3rem; color: #6b6b6b; font-size: .9rem; }
   /* the world: hidden until the first search, then it opens up */
-  .slate-world { opacity: 0; transform: translateY(40px); pointer-events: none; height: 0; overflow: hidden; transition: opacity .8s ease .25s, transform .8s cubic-bezier(.2,.8,.2,1) .25s; }
+  .slate-world { opacity: 0; transform: translateY(12px); pointer-events: none; height: 0; overflow: hidden; transition: opacity .22s ease, transform .22s ease; }
   body.opened .slate-hero { min-height: 0; padding: 2.5rem 0 1rem; }
   body.opened .slate-hero h1 { font-size: clamp(1.6rem, 3vw, 2.2rem); margin: .3rem 0 1.1rem; }
   body.opened .slate-sandra { width: 44px; height: 34px; margin-bottom: .4rem; }
@@ -82,14 +91,16 @@
   .slate-sort select { background: transparent; color: #0a0a0a; font-weight: 600; margin-left: .3rem; }
   body.slate-page #result-sub { color: #6b6b6b; }
   /* results keep their color: this is the world opening up */
-  body.slate-page #grid > * { animation: rise .6s cubic-bezier(.2,.8,.2,1) both; }
+  body.slate-page #grid > * { animation: rise .28s cubic-bezier(.2,.8,.2,1) both; }
   body.slate-page #grid > *:nth-child(2) { animation-delay: .05s } body.slate-page #grid > *:nth-child(3) { animation-delay: .1s }
   body.slate-page #grid > *:nth-child(4) { animation-delay: .15s } body.slate-page #grid > *:nth-child(n+5) { animation-delay: .2s }
   @keyframes rise { from { opacity: 0; transform: translateY(24px) scale(.98); } }
+  body.slate-page #grid > .search-skeleton { height: 220px; border-radius: 12px; background: linear-gradient(110deg, #eee 20%, #faf2f5 45%, #eee 70%); background-size: 220% 100%; animation: search-skeleton 1.3s linear infinite; }
+  @keyframes search-skeleton { to { background-position: -220% 0; } }
   body.slate-page .chip-btn { background: transparent; color: #4a4a4a; border: 1px solid #dcdcdc; }
   body.slate-page .chip-btn[aria-pressed="true"] { background: #0a0a0a; color: #fff; border-color: #0a0a0a; }
   body.slate-page .chip-btn[data-required="true"] { background: #ff5fa2; color: #fff; border-color: #ff5fa2; }
-  @media (prefers-reduced-motion: reduce) { .slate-hero, .slate-hero h1, .slate-world, .slate-sandra { transition: none; animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .slate-hero, .slate-hero h1, .slate-world, .slate-sandra, .slate-progress span, body.slate-page #grid > .search-skeleton { transition: none; animation: none; } }
 </style>
 {% endblock %}
 {% block scripts %}<script src="{{ url_for('static', filename='js/search.js') }}"></script>{% endblock %}

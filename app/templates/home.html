@@ -27,7 +27,8 @@
       <div id="room-nav" class="hidden relative">
         <div class="tl-pill p-0 overflow-hidden">
           <button id="room-prev" class="w-8 h-8 grid place-items-center hover:bg-black/5" aria-label="Previous room">‹</button>
-          <button id="room-name" class="px-1 min-w-[6.5rem]" title="Jump to a room">Rooms</button>
+          <button id="room-name" class="px-1 min-w-[6.5rem]" title="Go to a room in this property"
+                  aria-controls="room-menu" aria-expanded="false">Rooms</button>
           <button id="room-next" class="w-8 h-8 grid place-items-center hover:bg-black/5" aria-label="Next room">›</button>
         </div>
         <div id="room-menu" class="hidden absolute top-10 left-0 w-56 max-h-72 overflow-y-auto scroll-thin bg-white shadow-xl text-sm rounded-xl p-1.5 z-40"></div>
@@ -77,6 +78,19 @@
   <!-- bottom center: Sandra. One message at a time, one place to type. -->
   <div id="sandra-bar">
     <div id="hint" class="hint">Loading 3D tour…</div>
+    <section id="showcase-controls" class="showcase-controls" aria-label="Sandra's guided tour">
+      <div class="showcase-copy">
+        <span class="sandra-mark" aria-hidden="true"></span>
+        <div role="status"><p id="showcase-chapter">Guided tour</p><strong id="showcase-title">Sandra is getting ready</strong><p id="showcase-detail">Loading the property scan…</p></div>
+      </div>
+      <progress id="showcase-progress" max="1" value="0" aria-label="Current tour scene"></progress>
+      <div class="showcase-actions">
+        <button id="showcase-back" type="button" aria-label="Previous scene" disabled>‹</button>
+        <button id="showcase-play" type="button" disabled>Pause tour</button>
+        <button id="showcase-next" type="button" aria-label="Next scene" disabled>›</button>
+        <button id="showcase-explore" type="button">Explore &amp; edit</button>
+      </div>
+    </section>
     <div id="sandra-card" class="hidden" aria-live="polite">
       <span class="sandra-mark" aria-hidden="true"></span>
       <div id="guide-task" class="min-w-0 flex-1"></div>
@@ -116,11 +130,13 @@
 {% block scripts %}
 <script>
   window.HOME = {{ home | tojson }};
+  window.TOUR_PLAN = {{ tour_plan | tojson }};
   window.SDK_KEY = {{ sdk_key | tojson }};
 </script>
 <script defer src="{{ url_for('static', filename='js/tour.js') }}"></script>
 <script defer src="{{ url_for('static', filename='js/inventory.js') }}"></script>
 <script defer src="{{ url_for('static', filename='js/sandra-rover.js') }}"></script>
 <script defer src="{{ url_for('static', filename='js/empty-room.js') }}"></script>
+<script defer src="{{ url_for('static', filename='js/sandra-showcase.js') }}"></script>
 <script defer src="{{ url_for('static', filename='js/sandra-flow.js') }}"></script>
 {% endblock %}

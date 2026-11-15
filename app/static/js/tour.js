@@ -46,18 +46,21 @@ iframe.src = showcaseUrl;
 iframe.addEventListener('load', async () => {
   try {
     sdk = await iframe.contentWindow.MP_SDK.connect(iframe.contentWindow);
-    await new Promise((res) => { const sub = sdk.App.state.subscribe((s) => { if (s.phase === sdk.App.Phase.PLAYING) { res(); setTimeout(() => sub.cancel()); } }); });
+    let stateSub;
+    const ready = await soon(new Promise((resolve) => {
+      stateSub = sdk.App.state.subscribe((s) => { if (s.phase === sdk.App.Phase.PLAYING) resolve(true); });
+    }), 25000);
+    stateSub?.cancel();
+    if (!ready) throw new Error('The property scan did not finish loading.');
     window.hmSdk = sdk;
-    await sdk.Scene.register('fd.photo', () => new PhotoPatch());
-    await sdk.Scene.register('fd.sandra', () => new SandraRover());
-    rover = await addNode('fd.sandra', { shown: false, reduced: reducedRoverMotion.matches });
-    await loadRooms();
     sdk.Sweep.current.subscribe((s) => { stationedSweep = s.id || s.sid || ''; refreshVisibility(); scheduleCoverage(); });
     sdk.Camera.pose.subscribe(onPose);
-    await restoreEdits();
-    hint('Drag to look around. Tell Sandra what you’d change, or tap ✎ and paint over it.', 6000);
-    welcome();
-  } catch (e) { console.error(e); hint('3D tour failed to load: ' + (e.message || e)); }
+    await Promise.all([sdk.Scene.register('fd.photo', () => new PhotoPatch()), sdk.Scene.register('fd.sandra', () => new SandraRover())]);
+    rover = await addNode('fd.sandra', { shown: false, reduced: reducedRoverMotion.matches });
+    await Promise.all([loadRooms(), restoreEdits()]);
+    $('#hint').style.opacity = 0;
+    await welcome();
+  } catch (e) { console.error(e); window.sandraShowcase?.unavailable(); }
 });
 
 /* ================= photo patches ================= */
@@ -129,21 +132,47 @@ function sameFrame(a, b) {
 async function hitAt(x, y, viewer = sdk) {
   try { return (await viewer.Renderer.getWorldPositionData({ x, y })).position; } catch { return null; }
 }
-/* Walk to a scan point through its neighbors, like stepping through the house, instead of jumping. */
-async function walkTo(target) {
-  if (!poseCache || poseCache.sweep === target) return;
-  const byId = Object.fromEntries(sweepList.map((s) => [s.id, s]));
-  const prev = { [poseCache.sweep]: null }, q = [poseCache.sweep];
-  while (q.length && !(target in prev)) { const c = q.shift(); for (const n of byId[c]?.neighbors || []) if (!(n in prev) && byId[n]) { prev[n] = c; q.push(n); } }
-  const path = [];
-  if (target in prev) for (let c = target; c && c !== poseCache.sweep; c = prev[c]) path.unshift(c);
-  else path.push(target);
-  for (const id of path.slice(0, 12)) {
-    if (agentBusy) roverToSweep(id);
-    await soon(sdk.Sweep.moveTo(id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 520 }), 2500);
+/* Resolve routes exclusively against scan points in the active viewer. */
+function sweepPath(start, target) {
+  const byId = new Map(sweepList.filter((s) => s.enabled !== false).map((s) => [s.id, s]));
+  if (!byId.has(start) || !byId.has(target)) return [];
+  const previous = new Map([[start, null]]), queue = [start];
+  for (const id of queue) {
+    if (previous.has(target)) break;
+    for (const neighbor of byId.get(id).neighbors || []) {
+      if (previous.has(neighbor) || !byId.has(neighbor)) continue;
+      previous.set(neighbor, id);
+      queue.push(neighbor);
+    }
   }
-  if (path.length > 12) await soon(sdk.Sweep.moveTo(target, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }), 3000);
-  await sleep(250);
+  if (!previous.has(target)) return [];
+  const path = [];
+  for (let id = target; id && id !== start; id = previous.get(id)) path.unshift(byId.get(id));
+  return path;
+}
+async function visitSweep(id, transition, duration, active) {
+  if (!active()) return false;
+  // A move sent while the previous flight is still finishing is rejected; wait it out and retry once.
+  for (let attempt = 0; attempt < 2 && active() && stationedSweep !== id; attempt++) {
+    await soon(sdk.Sweep.moveTo(id, { transition: attempt ? sdk.Sweep.Transition.FADEOUT : transition,
+      transitionTime: attempt ? 360 : duration }), 5000);
+    for (let i = 0; i < 25 && active() && stationedSweep !== id; i++) await sleep(80);
+  }
+  return active() && stationedSweep === id;
+}
+async function walkTo(target, { active = () => true, roomJump = false } = {}) {
+  if (!poseCache || !sweepList.some((s) => s.id === target && s.enabled !== false)) return false;
+  if (stationedSweep === target) return true;
+  const path = sweepPath(stationedSweep || poseCache.sweep, target);
+  const transition = sdk.Sweep.Transition;
+  if (!path.length) return visitSweep(target, transition.FADEOUT, 480, active);
+  for (const step of path) {
+    if (!active()) return false;
+    if (agentBusy) roverToSweep(step.id);
+    const reduced = roomJump && reducedRoverMotion.matches;
+    if (!await visitSweep(step.id, reduced ? transition.FADEOUT : transition.FLY, reduced ? 260 : 530, active)) return false;
+  }
+  return true;
 }
 /* Spotlight an exact item on screen (loc.rect is normalized for the view at loc.rot). */
 function spotlight(loc) {
@@ -161,17 +190,19 @@ async function goTo(loc) {
   await walkTo(loc.sweep); await lookAt(loc.rot, 120); await sleep(150);
   spotlight(loc);
 }
-function stopAgentSoft() { /* navigating from chat while the tour waits for an answer is fine */ }
+function stopAgentSoft() { window.sandraShowcase?.takeControl(); }
 // Camera.setRotation is sometimes ignored by the SDK; rotate (yaw -h, pitch +v) and verify.
-async function lookAt(rot, speed = 10000) {     // speed in degrees/second; ~90 looks like turning your head
+async function lookAt(rot, speed = 10000, active = () => true) {     // speed in degrees/second; ~90 looks like turning your head
   const off = () => { const c = poseCache.rotation; return { dy: ((rot.y - c.y + 540) % 360) - 180, dx: rot.x - c.x }; };
   for (let k = 0; k < 4; k++) {
+    if (!active()) return false;
     const { dy, dx } = off();
     if (Math.abs(dy) < 0.6 && Math.abs(dx) < 0.6) return true;
     const ms = Math.min(4000, (Math.max(Math.abs(dy), Math.abs(dx)) / speed) * 1000);
     await soon(sdk.Camera.rotate(-dy, dx, { speed }), ms + 2500); await sleep(k ? 250 : Math.max(250, ms * 0.15));
     speed = Math.max(speed, 300);   // small corrections can be quick
   }
+  if (!active()) return false;
   let { dy, dx } = off();
   if (Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5) return true;
   // The animated turn can stall (busy or background tab). Setting the view at this scan point always lands.
@@ -228,11 +259,12 @@ function projectBox(world, pose, viewer, { w: W, h: Hh }) {
 
 /* ================= rooms ================= */
 let sweepList = [], roomList = [], roomIdx = 0;
-async function collect(obs) {
+let roomNavigation = Promise.resolve(), requestedRoom = null, roomRequest = 0;
+async function collect(obs, wait = 4300) {
   let latest = [], settle, timeout, sub;
   return new Promise((resolve) => {
     const done = () => { clearTimeout(settle); clearTimeout(timeout); sub?.cancel?.(); resolve(latest); };
-    timeout = setTimeout(done, 6500);
+    timeout = setTimeout(done, wait);
     sub = obs.subscribe({ onCollectionUpdated: (collection) => {
       const batch = Object.values(collection);
       if (!batch.length) return;
@@ -243,14 +275,14 @@ async function collect(obs) {
   });
 }
 async function loadRooms() {
-  sweepList = await collect(sdk.Sweep.data);
-  let rooms = await collect(sdk.Room.data).catch(() => []);
+  const [sweeps, sdkRooms] = await Promise.all([collect(sdk.Sweep.data), collect(sdk.Room.data, 1800).catch(() => [])]);
+  sweepList = sweeps;
+  let rooms = sdkRooms;
   if (!rooms.filter((r) => r.label).length) {
-    for (let i = 0; i < 100 && !info; i++) await sleep(100);
     rooms = (info?.scan?.rooms || []).map((r) => ({ id: r.id, label: r.type }));
   }
   const bySweep = {};
-  for (const s of sweepList) if (s.roomInfo?.id) (bySweep[s.roomInfo.id] ||= []).push(s);
+  for (const s of sweepList) if (s.enabled !== false && s.roomInfo?.id) (bySweep[s.roomInfo.id] ||= []).push(s);
   roomList = rooms.filter((r) => r.label && bySweep[r.id]).map((r) => ({ id: r.id, label: r.label.split(/,| \/ /)[0].trim(), sweeps: bySweep[r.id] }));
   if (!roomList.length) {
     roomList = Object.entries(bySweep).map(([id, sweeps], index) => ({ id, label: 'Room ' + (index + 1), sweeps }));
@@ -258,25 +290,62 @@ async function loadRooms() {
   const n = {}; roomList.forEach((r) => { n[r.label] = (n[r.label] || 0) + 1; r.k = n[r.label]; });
   roomList.forEach((r) => { if (n[r.label] > 1) r.label += ' ' + r.k; });
   $('#room-nav').classList.toggle('hidden', !roomList.length);
+  updateRoomLabel();
 }
 const currentRoom = () => { const s = sweepList.find((x) => x.id === lastSweep); return roomList.find((r) => r.id === s?.roomInfo?.id); };
 function centerSweep(r) {
   const cx = r.sweeps.reduce((a, s) => a + s.position.x, 0) / r.sweeps.length, cz = r.sweeps.reduce((a, s) => a + s.position.z, 0) / r.sweeps.length;
   return [...r.sweeps].sort((a, b) => Math.hypot(a.position.x - cx, a.position.z - cz) - Math.hypot(b.position.x - cx, b.position.z - cz))[0];
 }
-async function goRoom(i) {
-  if (!roomList.length) return;
-  roomIdx = (i + roomList.length) % roomList.length;
-  $('#room-name').textContent = roomList[roomIdx].label;
-  await soon(sdk.Sweep.moveTo(centerSweep(roomList[roomIdx]).id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }));
+function updateRoomLabel() {
+  const actual = currentRoom();
+  if (actual) roomIdx = roomList.indexOf(actual);
+  const label = $('#room-name');
+  label.textContent = requestedRoom == null ? actual?.label || 'Between rooms' : 'To ' + roomList[requestedRoom].label + '…';
+  label.setAttribute('aria-busy', String(requestedRoom != null));
 }
-$('#room-prev').onclick = () => { stopAgent(); goRoom(roomIdx - 1); };
-$('#room-next').onclick = () => { stopAgent(); goRoom(roomIdx + 1); };
+function goRoom(i) {
+  if (!roomList.length) return;
+  const release = stopAgent();
+  window.emptyRoom?.leave();
+  switchView('tour');
+  setMode('walk');
+  requestedRoom = (i + roomList.length) % roomList.length;
+  const room = roomList[requestedRoom], request = ++roomRequest;
+  const active = () => request === roomRequest;
+  updateRoomLabel();
+  roomNavigation = roomNavigation.then(async () => {
+    await release;
+    if (!active()) return;
+    const closest = centerSweep(room);
+    const origin = stationedSweep || poseCache.sweep;
+    const reachable = (s) => s.id === origin || sweepPath(origin, s.id).length;
+    const target = reachable(closest) ? closest : room.sweeps.find(reachable) || closest;
+    const arrived = await walkTo(target.id, { active, roomJump: true });
+    if (!arrived && active()) hint('Could not reach ' + esc(room.label) + '. Try again.', 3500);
+  }).catch((err) => {
+    console.warn('Room navigation', err);
+    if (active()) hint('Could not reach ' + esc(room.label) + '. Try again.', 3500);
+  }).finally(() => {
+    if (!active()) return;
+    requestedRoom = null;
+    updateRoomLabel();
+  });
+  return roomNavigation;
+}
+$('#room-prev').onclick = () => goRoom((requestedRoom ?? roomIdx) - 1);
+$('#room-next').onclick = () => goRoom((requestedRoom ?? roomIdx) + 1);
 $('#room-name').onclick = () => {
-  const m = $('#room-menu');
-  m.innerHTML = roomList.map((r, i) => `<button data-i="${i}" class="block w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-100">${esc(r.label)}</button>`).join('');
-  m.querySelectorAll('[data-i]').forEach((b) => b.onclick = () => { m.classList.add('hidden'); stopAgent(); goRoom(+b.dataset.i); });
-  m.classList.toggle('hidden');
+  const menu = $('#room-menu'), label = $('#room-name');
+  menu.replaceChildren(...roomList.map((room, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'block w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-100';
+    button.textContent = room.label;
+    button.onclick = () => { menu.classList.add('hidden'); label.setAttribute('aria-expanded', 'false'); goRoom(index); };
+    return button;
+  }));
+  label.setAttribute('aria-expanded', String(!menu.classList.toggle('hidden')));
 };
 
 /* ================= scan-point previews ================= */
@@ -285,10 +354,11 @@ function onPose(p) {
   if (rover && p.mode !== 'mode.inside') rover.component.inputs.shown = false;
   if (p.sweep !== lastSweep) {
     lastSweep = p.sweep;
-    const r = currentRoom(); if (r) roomIdx = roomList.indexOf(r);
-    $('#room-name').textContent = r ? r.label : 'Between rooms';
+    updateRoomLabel();
     scheduleCoverage();
-    if (!agentBusy && p.mode === 'mode.inside') setTimeout(() => setRoverState('idle'), 450);
+    if (!agentBusy && !window.sandraShowcase?.playing && p.mode === 'mode.inside') {
+      setTimeout(() => { if (!window.sandraShowcase?.playing) setRoverState('idle'); }, 450);
+    }
   }
   refreshVisibility();
   overlay.querySelectorAll('.sel-box').forEach((e) => e.remove());
@@ -297,6 +367,7 @@ function onPose(p) {
   if (mode === 'walk' && edits.some((e) => e.source && !e.patches.some((patch) => patch.sweep === p.sweep))) scheduleCoverage();
 }
 function refreshVisibility() {
+  window.sandraShowcase?.refreshPreview();
   for (const e of edits) {
     for (const p of e.patches) {
       const component = live[e.id]?.patches[p.sweep]?.component;
@@ -708,7 +779,24 @@ async function command(sel, instruction, label, finding = null, objects = []) {
   const e = newEdit(sel, { title: label || instruction, instruction });
   try {
     if (!finding) ({ finding, objects } = await planSelection(sel, instruction));
-    if (!finding) throw new Error('I could not identify that change in this view.');
+    // A typed request names something that may be behind you: look around this spot before giving up.
+    if (!finding && sel.whole && poseCache?.mode === 'mode.inside') {
+      const start = { ...poseCache.rotation };
+      for (let k = 1; k < 4 && !finding; k++) {
+        setStatus(e, 'understanding', { title: 'Looking around for it…' });
+        await lookAt({ x: -12, y: start.y + k * 90 }, 160);
+        await sleep(450);
+        try {
+          sel = await makeSelection({ x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, null,
+            { silent: true, whole: true });
+          selFor.set(e.id, sel);
+          ({ finding, objects } = await planSelection(sel, instruction));
+        } catch (err) { console.warn('look around', err); }
+      }
+      if (!finding) await lookAt(start, 160);
+      e.title = label || instruction;
+    }
+    if (!finding) throw new Error('I couldn’t find that from here. Walk to it, or tap ✎ and paint over it.');
     const target = editTarget(sel, finding, instruction, objects);
     if (!target) throw new Error('I could not confirm the target in your selection. Try circling the fixture again.');
     const { source, ...identity } = target;
@@ -729,6 +817,7 @@ async function command(sel, instruction, label, finding = null, objects = []) {
     if (QUEUE_MODE && !finding.now) {
       // The buyer keeps touring; Sandra builds everything at once later and then walks them through it.
       e.pending = source;
+      e.replaces = duplicate?.id;
       setStatus(e, 'queued');
       const n = edits.filter((x) => x.status === 'queued').length;
       say('<strong>Added: ' + esc(e.title) + '</strong><p>' + (option ? 'About ' + money(option.total) + ' installed. ' : '') +
@@ -1023,6 +1112,7 @@ const CHANGE_RE = /\b(make|turn|change|replace|remove|add|convert|swap|install|g
 $('#chat-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const msg = $('#chat-input').value.trim(); if (!msg) return;
+  window.sandraShowcase?.takeControl();
   $('#chat-input').value = '';
   bubble(esc(msg), 'user'); chatHistory.push({ role: 'user', content: msg });
   if (window.sandraFlow?.onMessage && await window.sandraFlow.onMessage(msg)) return;
@@ -1063,10 +1153,12 @@ function setSandraState(phase, title, detail = '') {
   setCard(el);
 }
 function stopAgent() {
+  const release = window.sandraShowcase?.takeControl();
   if (agentBusy) {
     agentAbort = true;
     tourDecision?.('stop');
   }
+  return release;
 }
 async function startAgent() {
   if (agentBusy) return;
@@ -1290,8 +1382,10 @@ async function guidedTour() {
 function save() { try { localStorage.setItem(STORE, JSON.stringify(edits, (k, v) => k === 'pending' ? undefined : v)); } catch {} }
 async function restoreEdits() {
   try { edits = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch { edits = []; }
-  edits = edits.filter((e) => e.status === 'ready' && e.patches.length);   // unfinished work can't resume after a reload
-  for (const e of edits) for (const p of e.patches) if (p.pose) await mountPatch(e, p, e.revision);
+  edits = Array.isArray(edits) ? edits.filter((e) => e?.status === 'ready' && e.patches?.length) : [];
+  for (const e of edits) for (const p of e.patches) if (p.pose) {
+    try { await mountPatch(e, p, e.revision); } catch (err) { console.warn('Saved preview could not reopen', err); }
+  }
   save(); refreshVisibility(); renderPlan();
 }
 function removeEdit(id, quiet = false) {
@@ -1372,7 +1466,7 @@ function renderPlan() {
 $('#plan-clear').onclick = () => [...edits].forEach((e) => removeEdit(e.id, true));
 async function flyTo(e) {
   if (!e?.patches.length) return;
-  switchView('tour'); closeDrawers(); setView('after');
+  window.sandraShowcase?.takeControl(); switchView('tour'); closeDrawers(); setView('after');
   const p = e.patches.find((x) => !x.extra) || e.patches[0];
   await soon(sdk.Sweep.moveTo(p.sweep, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }));
   await lookAt(p.rot || poseCache.rotation);
@@ -1392,12 +1486,21 @@ $('#compare').onclick = () => setView(view === 'after' ? 'orig' : 'after');
 /* ================= drawers, tabs, panels ================= */
 function closeDrawers() { document.querySelectorAll('[data-drawer-panel]').forEach((d) => d.classList.remove('open')); }
 document.querySelectorAll('[data-drawer]').forEach((b) => b.onclick = () => {
+  if (window.sandraShowcase?.playing) window.sandraShowcase.takeControl();
   const d = document.querySelector(`[data-drawer-panel="${b.dataset.drawer}"]`), open = d.classList.contains('open');
   closeDrawers();
-  if (!open) { d.classList.add('open'); if (b.dataset.drawer === 'outside' && !$('#aerial-thumb').src) $('#aerial-thumb').src = `/api/home/${H.id}/aerial.jpg`; }
+  if (!open) {
+    d.classList.add('open');
+    if (b.dataset.drawer === 'outside' && !$('#aerial-thumb').hasAttribute('src')) {
+      $('#aerial-thumb').src = `/api/home/${H.id}/aerial.jpg`;
+      loadOutside().catch(() => {});
+    }
+    if (b.dataset.drawer === 'access' && !info?.scan?.rooms?.length) loadAccess(false);
+  }
 });
 document.querySelectorAll('[data-drawer-panel] [data-close]').forEach((b) => b.onclick = closeDrawers);
 function switchView(v) {
+  if (v === 'photos') window.sandraShowcase?.takeControl();
   document.querySelectorAll('.view-tab').forEach((b) => b.className = 'view-tab px-4 py-1.5 rounded-full ' + (b.dataset.view === v ? 'bg-brand-600 text-white' : ''));
   $('#photos').classList.toggle('hidden', v !== 'photos');
 }
@@ -1427,7 +1530,7 @@ let hintTimer;
 function hint(html, ms) { const h = $('#hint'); h.innerHTML = html; h.style.opacity = 1; clearTimeout(hintTimer); if (ms) hintTimer = setTimeout(() => h.style.opacity = 0, ms); }
 
 function welcome() {
-  if (window.sandraFlow) { scheduleCoverage(); return window.sandraFlow.start(); }
+  if (window.sandraFlow) return window.sandraFlow.start();
   setSandraState('Ready to explore', edits.length ? 'Welcome back' : 'Let’s take a look',
     edits.length ? edits.length + ' changes in your plan. I’ll check what’s already covered as we walk.' :
       'Start a guided tour, or ask me about a fixture in this view.');
@@ -1435,11 +1538,15 @@ function welcome() {
   scheduleCoverage();
 }
 
-(async () => {
-  renderPlan();
-  info = await fetch(`/api/home/${H.id}?needs=${NEEDS.join(',')}`).then((r) => r.json());
-  renderAccess(info); loadOutside();
-})();
+async function loadAccess(cached = true) {
+  try {
+    const query = new URLSearchParams({ needs: NEEDS.join(','), cached: cached ? '1' : '0' });
+    const data = await fetch(`/api/home/${H.id}?${query}`).then((r) => r.json());
+    if (data.evidence) { info = data; renderAccess(info); }
+  } catch {}
+}
+renderPlan();
+loadAccess();
 
 /* hooks for the issue reporter (report.js) */
 window.FD_SHOT = async () => {

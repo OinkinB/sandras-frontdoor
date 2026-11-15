@@ -8,6 +8,27 @@ photo-realistically and in place, what it would look like with the changes you n
 Built at HackPrinceton 2026 for the CoStar track, using CoStar/Homes.com listing data, Matterport 3D tours and Vexcel
 aerial imagery.
 
+## Fast search and prepared walkthroughs
+
+- Search uses a single-line search field. Enter shows a progress bar and result placeholders immediately. The local
+  evidence pass ranks listings before the natural-language provider responds. Existing results stay visible during
+  refinement and survive a failed or slow refinement. The server sorts candidates before constructing public cards and
+  caches successful interpretations. Search keeps explicit budget, city, bedroom and must-have constraints during
+  refinement. Roll-in showers have their own filter, and a single story alone is insufficient evidence of step-free entry.
+- The first home view uses listing evidence and any cached Matterport room metadata. The full scan metadata lookup and
+  Vexcel requests run when their drawers need them. The default tour makes no inference or generation API calls.
+- Sandra automatically plays a short sequence of rooms using the real sweep graph. The camera turns toward the next
+  sweep while Sandra leads along the route. Scenes advance on a timer. Pause, previous, next, replay and explore are
+  available throughout. Dragging the tour hands camera control to the buyer. Reduced-motion visitors start playback
+  explicitly and get fades instead of fly-throughs.
+- `app/services/showcase.py` holds room cues and a pre-authored support-rail concept for listing `236060791`.
+  The rail mounts at measured points in that Matterport scan. It is a visual example, separate from the buyer's
+  installation plan. Other listings play their rooms and evidence cues, and any already-approved changes from the
+  buyer's browser are replayed. The tour distinguishes listing evidence, room checks, examples and saved changes.
+- The buyer can explore and submit edits from the same page. **Make my changes** builds the queued items separately
+  from the tour and replays the approved results using the same timeline. Failed revisions preserve the earlier
+  approved edit. The original furnished view is the default, and **Preview empty here** is an explicit option.
+
 ## Sandra experience and implementation notes
 
 ### Search and fit
@@ -149,31 +170,28 @@ Generated image quality still needs a provider-backed check.
 
 ---
 
-### The tour, in the buyer's hands
-The tour is full-screen Matterport with the listing small at top left and Sandra at bottom center: one card (one
-question or answer at a time) above one input. Flow (`app/static/js/sandra-flow.js`):
-1. **Who is it for?** Sandra asks first (multi-select or your own words) and never assumes a wheelchair; older age maps
-   to aging-in-place changes. Saved per browser; "More → Change who it's for" edits it.
-2. **Explore at your own pace.** Sandra never moves the camera here. When you settle in a new room she looks at what you
-   see and may point out one thing ("Add to my list" / "No thanks"). Type a change, or tap ✎ and paint over anything
-   (a real brush; Ctrl+Z removes the last stroke). Each change is understood and priced right away and goes on your list.
-3. **Make my changes.** Sandra builds the whole list (render, review, auto-fix), then walks you through each change like a
-   realtor: she goes there, frames it, explains it with its price, and you pick Next / Remove this / I'll look around.
+### Editing after the walkthrough
+Choose **Explore & edit** and type a change or paint over a fixture. Ctrl+Z removes the last brush stroke.
+Sandra prices the draft and adds it to your list. **Make my changes** builds the drafts and then plays the approved
+previews. To revise the needs from search, use **More → Change who it’s for**.
 
-### Empty rooms (automatic)
-Furnished listings are hard to picture as your own. The moment you arrive at a scan point, Sandra captures its
+### Empty rooms
+When **Preview empty here** is selected, Sandra captures only the active scan point's
 360° panorama (`Renderer.takeEquirectangular`), the image model removes furniture and belongings while keeping
 walls, windows, doors, floors and built-ins pixel-aligned (so real dimensions are untouched), a quick vision check
 retries once if anything big is left, and the result is wrapped on a sphere centered on that scan point
 (`app/static/js/empty-room.js`, `imaging.empty_pano`, `GET/POST /api/home/<id>/empty/<sweep>`). Panoramas are cached
 per scan point. The panorama is centered on the camera heading at capture, so the sphere turns by that heading - 90°.
-"Show furnished" brings everything back for comparison.
+**Show original** or walking away clears the preview immediately. The room chooser stops the automatic
+walkthrough and follows connected scan points within the selected property. The label updates once the camera
+reaches the room. The empty-room service verifies the property and scan-point registration and stores verified
+captures separately so older cached panoramas remain untouched.
 
 ## How it works
 
 ```
-Search ──► /api/search ──► AI parses needs ──► rank homes (listings.py)
-Tour   ──► Matterport bundle (Showcase SDK) in an iframe
+Search ──► /api/search ──► rank homes from local evidence ──► refine the interpretation
+Tour   ──► Matterport bundle (Showcase SDK) ──► play prepared scenes and saved edits
            ├─ select (draw/box) ──► freeze frame + camera pose
            ├─ /api/home/<id>/agent/plan   (Gemini vision: find the object, issue, fix, 3 priced options)
            ├─ /api/home/<id>/render       (mask + edit + color-match + feather → patch PNG)

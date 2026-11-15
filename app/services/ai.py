@@ -21,7 +21,7 @@ IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
-def _access_token():
+def _access_token(timeout=60):
     if _token["value"] and time.time() < _token["exp"]:
         return _token["value"]
     tok = None
@@ -29,11 +29,15 @@ def _access_token():
         import google.auth
         import google.auth.transport.requests
         creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        creds.refresh(google.auth.transport.requests.Request())
+        transport = google.auth.transport.requests.Request()
+        def auth_request(*args, **kwargs):
+            kwargs["timeout"] = min(kwargs.get("timeout") or timeout, timeout)
+            return transport(*args, **kwargs)
+        creds.refresh(auth_request)
         tok = creds.token
     except Exception:
         exe = shutil.which("gcloud") or "gcloud"
-        out = subprocess.run(f'"{exe}" auth print-access-token', shell=True, capture_output=True, text=True, timeout=60)
+        out = subprocess.run(f'"{exe}" auth print-access-token', shell=True, capture_output=True, text=True, timeout=timeout)
         tok = out.stdout.strip()
     if not tok:
         raise RuntimeError("No Google Cloud credentials (run `gcloud auth login`)")
@@ -45,7 +49,7 @@ def _gemini_raw(model, parts, gen_config, timeout=180):
     proj = os.environ["GCP_PROJECT"]
     url = f"https://aiplatform.googleapis.com/v1/projects/{proj}/locations/global/publishers/google/models/{model}:generateContent"
     r = requests.post(url, json={"contents": [{"role": "user", "parts": parts}], "generationConfig": gen_config},
-                      timeout=timeout, headers={"Authorization": f"Bearer {_access_token()}"})
+                      timeout=timeout, headers={"Authorization": f"Bearer {_access_token(min(60, timeout))}"})
     r.raise_for_status()
     cand = (r.json().get("candidates") or [{}])[0]
     parts = (cand.get("content") or {}).get("parts")
@@ -58,37 +62,37 @@ def _img_part(mime, data):
     return {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}}
 
 
-def _gemini(prompt, images, want_json):
+def _gemini(prompt, images, want_json, timeout=180):
     parts = [_img_part(m, b) for m, b in images] + [{"text": prompt}]
     cfg = {"temperature": 0.3}
     if GEMINI_MODEL.startswith("gemini-3"):     # these tasks need quick judgement, not long deliberation
         cfg["thinkingConfig"] = {"thinkingLevel": os.environ.get("GEMINI_THINKING", "low")}
     if want_json:
         cfg["responseMimeType"] = "application/json"
-    out = _gemini_raw(GEMINI_MODEL, parts, cfg)
+    out = _gemini_raw(GEMINI_MODEL, parts, cfg, timeout=timeout)
     return "".join(p.get("text", "") for p in out if not p.get("thought"))
 
 
-def _openai(prompt, images, want_json):
+def _openai(prompt, images, want_json, timeout=120):
     content = [{"type": "text", "text": prompt}]
     for m, b in images:
         content.append({"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(b).decode()}"}})
     body = {"model": OPENAI_MODEL, "messages": [{"role": "user", "content": content}], "temperature": 0.3}
     if want_json:
         body["response_format"] = {"type": "json_object"}
-    r = requests.post("https://api.openai.com/v1/chat/completions", json=body, timeout=120,
+    r = requests.post("https://api.openai.com/v1/chat/completions", json=body, timeout=timeout,
                       headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"})
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
-def ask(prompt, images=(), want_json=True):
+def ask(prompt, images=(), want_json=True, timeout=None):
     errors = []
     for fn, ok in ((_gemini, os.environ.get("GCP_PROJECT")), (_openai, os.environ.get("OPENAI_API_KEY"))):
         if not ok:
             continue
         try:
-            text = fn(prompt, list(images), want_json)
+            text = fn(prompt, list(images), want_json, timeout=timeout) if timeout else fn(prompt, list(images), want_json)
             if want_json:
                 text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```")
                 return json.loads(text)
@@ -183,7 +187,7 @@ def _as_obj(res, list_key):
 
 # ---------- task prompts ----------
 
-NEED_KEYS = ["no_stairs", "step_free_entry", "wide_doorways", "walk_in_shower", "grab_bars",
+NEED_KEYS = ["no_stairs", "step_free_entry", "wide_doorways", "walk_in_shower", "roll_in_shower", "grab_bars",
              "first_floor_bedroom", "smooth_flooring", "garage", "lever_handles", "visual_alerts",
              "even_lighting", "quiet_space"]
 
@@ -205,14 +209,15 @@ ROLL_UNDER = (
 def parse_query(text: str) -> dict:
     prompt = f"""Turn a home-seeker's request into search filters for an accessible-home search.
 Request: "{text}"
-Return JSON: needs: subset of {NEED_KEYS} (wheelchair -> no_stairs, step_free_entry, wide_doorways, walk_in_shower, smooth_flooring;
+Return JSON: needs: subset of {NEED_KEYS} (wheelchair -> no_stairs, step_free_entry, wide_doorways, roll_in_shower, smooth_flooring;
 elderly/aging in place -> no_stairs, first_floor_bedroom, grab_bars, walk_in_shower; dexterity -> lever_handles;
 hearing access -> visual_alerts; low vision -> even_lighting; noise sensitivity -> quiet_space).
 required: subset of needs representing explicitly stated must-haves or structural constraints clearly necessary to the buyer.
 Keep unspecified preferences flexible. Do not infer wheelchair use for other accessibility needs.
+Only use roll_in_shower for roll-in, curbless or clear wheelchair access. A regular walk-in shower may still have a curb.
 max_price: number|null; min_beds: number|null;
 city: "Houston"|"Los Angeles"|null; rent: true|false|null; persona: one sentence about the user's situation; summary: short phrase."""
-    return ask(prompt)
+    return ask(prompt, timeout=4)
 
 
 def analyze_selection(crop: bytes, full: bytes, room: str, instruction: str | None, size: dict | None,
@@ -242,7 +247,9 @@ def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, 
     target = ""
     if instruction:
         target = (f'THE USER ASKED: "{instruction}". Find the existing object they mean and propose exactly that change, '
-                  "following their wishes on details. ")
+                  "following their wishes on details. If the object they name (or the spot they describe, e.g. beside "
+                  "the toilet) is NOT clearly visible in these photos, return {\"findings\": []}; never substitute a "
+                  "different object or a reflection. ")
         if outlined:
             target += ("A magenta outline in the photo marks roughly where they pointed; it may be loose or partial. "
                        "box_2d must enclose the WHOLE object to change (e.g. the entire tub and its surround), not the outline. ")
