@@ -1,43 +1,95 @@
 {% extends "base.html" %}
 {% block title %}FrontDoor · Find a home with Sandra{% endblock %}
+{% block bodyclass %}slate-page{% endblock %}
 {% block body %}
-<main class="sandra-search max-w-[1500px] mx-auto px-4 md:px-8">
-  <section class="search-hero">
-    <div class="search-hero-visual" aria-hidden="true"><img id="hero-img" src="{{ url_for('static', filename='img/frontdoor-home.jpg') }}" alt=""><div></div></div>
-    <div class="search-hero-copy">
-      <div class="sandra-kicker"><span class="status-light"></span>Sandra</div>
-      <h1>A home that<br>fits your life.</h1>
-      <p>Tell me where you’re looking, your budget, and what the home must already have.</p>
-      <form id="search-form" class="sandra-input">
-        <label for="q" class="sr-only">Tell Sandra what you need in a home</label>
-        <textarea id="q" rows="2" placeholder="For example, a single-level home in Houston under $400,000…"></textarea>
-        <button class="sandra-primary">Find homes <span aria-hidden="true">↗</span></button>
-      </form>
-      <div class="search-examples" aria-label="Search examples">
-        <button type="button" data-example="Step-free entry and a main-floor bedroom in Houston under $400,000.">Step-free living</button>
-        <button type="button" data-example="I'm hard of hearing and need a quiet home with visual alerts in Los Angeles.">Hearing access</button>
-        <button type="button" data-example="I have low vision and need even lighting, simple circulation and lever handles in Houston.">Lighting and handles</button>
-      </div>
-      <p id="persona" role="status"></p>
+<main class="slate">
+  <!-- 1. The blank slate: one question -->
+  <section class="slate-hero">
+    <div class="slate-sandra" aria-hidden="true"><span class="eye"></span><span class="eye"></span><span class="cheek l"></span><span class="cheek r"></span></div>
+    <div class="slate-kicker">Sandra</div>
+    <h1>What do you need<br>in a home?</h1>
+    <form id="search-form" class="slate-input">
+      <label for="q" class="sr-only">Tell Sandra what you need in a home</label>
+      <textarea id="q" rows="1" placeholder="Single-level, step-free, near Houston, under $400k…"></textarea>
+      <button aria-label="Find homes">→</button>
+    </form>
+    <div class="slate-examples" aria-label="Examples">
+      <button type="button" data-example="I use a wheelchair: step-free entry, wide doors and a roll-in shower in Houston under $400,000.">Wheelchair</button>
+      <button type="button" data-example="Aging in place: bedroom and bath on the main floor, grab bars, no stairs, Houston.">Aging in place</button>
+      <button type="button" data-example="I'm hard of hearing and need a quiet home with visual alerts in Los Angeles.">Hearing</button>
+      <button type="button" data-example="I have low vision and need even lighting, simple circulation and lever handles in Houston.">Low vision</button>
     </div>
+    <p id="persona" role="status"></p>
   </section>
-  <section class="search-preferences" aria-label="Accessibility filters">
-    <div class="flex items-center flex-wrap gap-3 justify-between">
-      <h2>Access preferences</h2>
-      <button type="button" id="required-mode" class="sandra-secondary" aria-pressed="false">Mark must-haves</button>
+
+  <!-- 2. The world opens up after you answer -->
+  <section class="slate-world" aria-live="polite">
+    <img id="hero-img" alt="" class="hidden">
+    <div class="slate-prefs">
+      <div id="chips" class="flex flex-wrap gap-2"></div>
+      <button type="button" id="required-mode" class="slate-ghost" aria-pressed="false">Mark must-haves</button>
     </div>
-    <div id="chips" class="flex flex-wrap gap-2"></div>
-  </section>
-  <section id="results" class="search-results">
-    <div class="flex flex-wrap items-end justify-between gap-4">
-      <div><h2>Homes to explore</h2><p id="result-sub" role="status"></p></div>
-      <label class="search-sort">Sort by
-        <select id="sort">
-          <option value="match">Best fit</option><option value="true">Lowest estimated total</option><option value="mods">Lowest estimated changes</option>
-        </select></label>
+    <div class="flex flex-wrap items-end justify-between gap-4 mt-8">
+      <div><h2 class="slate-h2">Homes Sandra found for you</h2><p id="result-sub" role="status" class="text-sm"></p></div>
+      <label class="text-sm slate-sort">Sort
+        <select id="sort"><option value="match">Best fit</option><option value="true">Lowest total</option><option value="mods">Fewest changes</option></select></label>
     </div>
     <div id="grid" class="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"></div>
   </section>
 </main>
+<style>
+  /* monochrome blank slate; Sandra is the only color */
+  body.slate-page { background: #fafafa; color: #0a0a0a; }
+  body.slate-page .sandra-header { background: #fafafa; border-color: #ececec; color: #0a0a0a; }
+  body.slate-page .sandra-nav a { color: #6b6b6b; } body.slate-page .sandra-nav a:hover { color: #0a0a0a; }
+  body.slate-page #report-slot button { color: #6b6b6b; border-color: #dcdcdc; background: transparent; }
+  body.slate-page .sandra-mark { background: #0a0a0a; border-color: #0a0a0a; }
+  body.slate-page .sandra-mark::before, body.slate-page .sandra-mark::after { background: #fff; box-shadow: none; }
+  .slate { max-width: 1500px; margin: 0 auto; padding: 0 1.25rem 4rem; }
+  .slate-hero { min-height: calc(100vh - 57px); display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+    transition: min-height .8s cubic-bezier(.2,.8,.2,1), padding .8s; }
+  .slate-hero h1 { font-size: clamp(2.4rem, 6vw, 4.6rem); line-height: 1; letter-spacing: -.055em; font-weight: 700; margin: .6rem 0 2rem; transition: font-size .8s cubic-bezier(.2,.8,.2,1), margin .8s; }
+  .slate-kicker { font: 600 .72rem 'Space Mono', monospace; letter-spacing: .3em; text-transform: uppercase; color: #8a8a8a; }
+  .slate-sandra { position: relative; width: 64px; height: 50px; border-radius: 22px 22px 18px 18px; background: #ff5fa2; margin-bottom: 1rem;
+    box-shadow: 0 10px 30px -8px #ff5fa2aa; animation: sbob 3s ease-in-out infinite; }
+  .slate-sandra::before { content: ''; position: absolute; left: 50%; top: -14px; width: 3px; height: 14px; background: #3a1f2d; transform: translateX(-50%); }
+  .slate-sandra::after { content: ''; position: absolute; left: 50%; top: -20px; width: 10px; height: 10px; border-radius: 50%; background: #ffd166; transform: translateX(-50%); }
+  .slate-sandra .eye { position: absolute; top: 15px; width: 9px; height: 13px; border-radius: 6px; background: #fff; animation: sblink 4s infinite; }
+  .slate-sandra .eye:first-child { left: 17px; } .slate-sandra .eye:nth-child(2) { right: 17px; }
+  .slate-sandra .cheek { position: absolute; top: 31px; width: 8px; height: 4px; border-radius: 4px; background: #ff2d7a; }
+  .slate-sandra .cheek.l { left: 9px; } .slate-sandra .cheek.r { right: 9px; }
+  @keyframes sbob { 50% { transform: translateY(-5px) rotate(-3deg); } }
+  @keyframes sblink { 0%, 92%, 100% { transform: scaleY(1); } 95% { transform: scaleY(.15); } }
+  .slate-input { display: flex; align-items: center; gap: .5rem; width: min(680px, 100%); border-bottom: 2px solid #0a0a0a; padding: .4rem 0; }
+  .slate-input textarea { flex: 1; resize: none; background: transparent; outline: none; font-size: clamp(1.05rem, 2vw, 1.35rem); color: #0a0a0a; line-height: 1.4; }
+  .slate-input textarea::placeholder { color: #b0b0b0; }
+  .slate-input button { width: 46px; height: 46px; border-radius: 50%; background: #0a0a0a; color: #fff; font-size: 1.3rem; flex: none; transition: transform .2s; }
+  .slate-input button:hover { transform: translateX(3px); }
+  .slate-examples { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: center; margin-top: 1.4rem; }
+  .slate-examples button, .slate-ghost { border: 1px solid #dcdcdc; color: #4a4a4a; border-radius: 999px; padding: .38rem .9rem; font-size: .85rem; background: transparent; }
+  .slate-examples button:hover, .slate-ghost:hover { border-color: #0a0a0a; color: #0a0a0a; }
+  #persona { margin-top: 1rem; min-height: 1.3rem; color: #6b6b6b; font-size: .9rem; }
+  /* the world: hidden until the first search, then it opens up */
+  .slate-world { opacity: 0; transform: translateY(40px); pointer-events: none; height: 0; overflow: hidden; transition: opacity .8s ease .25s, transform .8s cubic-bezier(.2,.8,.2,1) .25s; }
+  body.opened .slate-hero { min-height: 0; padding: 2.5rem 0 1rem; }
+  body.opened .slate-hero h1 { font-size: clamp(1.6rem, 3vw, 2.2rem); margin: .3rem 0 1.1rem; }
+  body.opened .slate-sandra { width: 44px; height: 34px; margin-bottom: .4rem; }
+  body.opened .slate-sandra .eye { top: 10px; width: 7px; height: 9px; } body.opened .slate-sandra .eye:first-child { left: 11px; } body.opened .slate-sandra .eye:nth-child(2) { right: 11px; }
+  body.opened .slate-sandra .cheek { top: 22px; }
+  body.opened .slate-world { opacity: 1; transform: none; pointer-events: auto; height: auto; overflow: visible; }
+  .slate-prefs { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; justify-content: center; border-top: 1px solid #ececec; padding-top: 1.25rem; }
+  .slate-h2 { font-size: 1.5rem; font-weight: 700; letter-spacing: -.03em; }
+  .slate-sort select { background: transparent; color: #0a0a0a; font-weight: 600; margin-left: .3rem; }
+  body.slate-page #result-sub { color: #6b6b6b; }
+  /* results keep their color: this is the world opening up */
+  body.slate-page #grid > * { animation: rise .6s cubic-bezier(.2,.8,.2,1) both; }
+  body.slate-page #grid > *:nth-child(2) { animation-delay: .05s } body.slate-page #grid > *:nth-child(3) { animation-delay: .1s }
+  body.slate-page #grid > *:nth-child(4) { animation-delay: .15s } body.slate-page #grid > *:nth-child(n+5) { animation-delay: .2s }
+  @keyframes rise { from { opacity: 0; transform: translateY(24px) scale(.98); } }
+  body.slate-page .chip-btn { background: transparent; color: #4a4a4a; border: 1px solid #dcdcdc; }
+  body.slate-page .chip-btn[aria-pressed="true"] { background: #0a0a0a; color: #fff; border-color: #0a0a0a; }
+  body.slate-page .chip-btn[data-required="true"] { background: #ff5fa2; color: #fff; border-color: #ff5fa2; }
+  @media (prefers-reduced-motion: reduce) { .slate-hero, .slate-hero h1, .slate-world, .slate-sandra { transition: none; animation: none; } }
+</style>
 {% endblock %}
 {% block scripts %}<script src="{{ url_for('static', filename='js/search.js') }}"></script>{% endblock %}

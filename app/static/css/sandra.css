@@ -146,3 +146,7 @@
 @media (prefers-reduced-motion: reduce) {
   .sandra-shell *, .sandra-shell *::before, .sandra-shell *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
 }
+
+/* Sandra is pink everywhere she appears */
+.sandra-mark { background: #ff5fa2 !important; border-color: #ff8dc0 !important; box-shadow: 0 4px 14px -4px #ff5fa2aa; }
+.sandra-mark::before, .sandra-mark::after { background: #fff !important; box-shadow: none !important; }

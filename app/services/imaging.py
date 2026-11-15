@@ -23,6 +23,11 @@ Requirements:
 - Image 1 is authoritative for geometry. Keep the fixture on the same wall, at the same elevation,
   angle and footprint unless the task explicitly requests changing those. Do not duplicate it.
 - Preserve the shape and occlusion of any foreground doorway and nearby fixtures.
+- Perspective: the new item lies on the same surface plane as what it replaces (wall, door face, floor) and is
+  foreshortened exactly like that surface in this photo. Parts that stick out (a lever, grab bar, faucet spout)
+  project perpendicular to that surface, following its vanishing lines, with matching shading and shadows.
+- If the mask is larger than the old item, that extra room is there so the new item can be its real size
+  (e.g. a full-length lever handle); outside the new item, keep the original surface (door, wall, floor).
 - Match this photo's lighting direction, exposure, white balance, shadows, reflections, grain and lens softness.
 - Correct real-world scale for the room; the new item must sit on the real floor/wall with contact shadows.
 - Where something is removed, fill with the surrounding floor/wall/tile continuing naturally.
@@ -53,8 +58,16 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
         raise ValueError("The edit region must be inside the source photo.")
     x0, y0, x1, y1 = rect[0] * W, rect[1] * H, rect[2] * W, rect[3] * H
     sw, sh = max(8, x1 - x0), max(8, y1 - y0)
+    # Small fixtures (door knobs, switches, faucets): the replacement is often bigger than the original and
+    # a tiny crop hides the surface's perspective. Give the new item room and the model more context.
+    small = max(sw, sh) < 0.12 * max(W, H)
+    grow_rect = None
+    if small:
+        cxm, cym = (x0 + x1) / 2, (y0 + y1) / 2
+        gw, gh = max(sw * 2.6, 0.07 * W), max(sh * 1.7, 0.06 * H)
+        grow_rect = (max(0, cxm - gw / 2), max(0, cym - gh / 2), min(W, cxm + gw / 2), min(H, cym + gh / 2))
     # context window: the selection plus generous surroundings so the model sees perspective and light
-    pad = max(sw, sh) * 0.6 + 40
+    pad = max(max(sw, sh) * 0.6 + 40, 0.2 * max(W, H) if small else 0)
     cx0, cy0 = max(0, int(x0 - pad)), max(0, int(y0 - pad))
     cx1, cy1 = min(W, int(x1 + pad)), min(H, int(y1 + pad))
     ctx = full.crop((cx0, cy0, cx1, cy1))
@@ -67,8 +80,14 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
         ImageDraw.Draw(mask).polygon(pts, fill=255)
     else:
         ImageDraw.Draw(mask).rectangle(sel, fill=255)
+    if grow_rect:
+        ImageDraw.Draw(mask).rectangle((grow_rect[0] - cx0, grow_rect[1] - cy0, grow_rect[2] - cx0, grow_rect[3] - cy0), fill=255)
 
-    raw, provider = ai.edit_image(_jpeg(ctx), mask, PROMPT.format(task=task, ref=REF_NOTE if ref_png else ""), ref_png)
+    # upscale small crops so the model works at a useful resolution; the result is scaled back below
+    up = max(1.0, 1024 / max(cw, ch))
+    send_ctx = ctx.resize((round(cw * up), round(ch * up)), Image.LANCZOS) if up > 1 else ctx
+    send_mask = mask.resize(send_ctx.size) if up > 1 else mask
+    raw, provider = ai.edit_image(_jpeg(send_ctx), send_mask, PROMPT.format(task=task, ref=REF_NOTE if ref_png else ""), ref_png)
     out = Image.open(io.BytesIO(raw)).convert("RGB")
     out = out.resize((cw, ch), Image.LANCZOS)
 
@@ -80,7 +99,7 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
         out = Image.merge("RGB", [ch_.point(lambda v, k=k: min(255, v * k)) for ch_, k in zip(out.split(), gains)])
 
     # Feather inward. Generated pixels must never cover the counter, wall, or doorway outside the mask.
-    feather = max(2, min(8, int(0.015 * max(sw, sh))))
+    feather = max(2, min(8, int(0.015 * max(sw, sh) * (2.2 if small else 1))))
     alpha = ImageChops.multiply(mask, mask.filter(ImageFilter.GaussianBlur(feather)))
     patch = out.copy(); patch.putalpha(alpha)
     bbox = alpha.point(lambda v: 255 if v > 3 else 0).getbbox() or (0, 0, cw, ch)

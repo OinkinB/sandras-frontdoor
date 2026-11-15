@@ -101,9 +101,10 @@ async function run(q, filters) {
   }
 }
 const query = $('#q');
-$('#search-form').addEventListener('submit', (e) => { e.preventDefault(); run(query.value.trim()); });
+const openWorld = () => document.body.classList.add('opened');   // the blank slate opens up on the first answer
+$('#search-form').addEventListener('submit', (e) => { e.preventDefault(); if (!query.value.trim()) return; openWorld(); run(query.value.trim()); });
 query.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run(query.value.trim()); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!query.value.trim()) return; openWorld(); run(query.value.trim()); }
 });
 $('#sort').addEventListener('change', renderGrid);
 $('#required-mode').onclick = (e) => {
@@ -116,5 +117,5 @@ document.querySelectorAll('[data-example]').forEach((b) => { b.onclick = () => {
 try {
   if (performance.getEntriesByType('navigation')[0]?.type === 'back_forward') query.value = sessionStorage.getItem('fd-search-query') || '';
 } catch {}
-if (query.value.trim()) run(query.value.trim());
-else run('', { needs: [], required: [], rent: rent ? true : null });
+if (query.value.trim()) { openWorld(); run(query.value.trim()); }   // returning with a search: open straight away
+else setTimeout(() => query.focus(), 200);                             // otherwise: a blank slate, just the question
