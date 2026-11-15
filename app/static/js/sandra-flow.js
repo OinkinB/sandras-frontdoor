@@ -153,6 +153,8 @@
       mark(e, '◐');
       const tick = setInterval(() => { const s = STEPS[e.status]; if (s && e.status !== 'queued') step.textContent = `${i + 1} of ${list.length} · ${s[0]}`; }, 600);
       try {
+        step.textContent = `${i + 1} of ${list.length} · Looking at the whole ${e.item || 'area'}`;
+        e.pending = await reframe(e).catch((err) => { console.warn('reframe', err); return e.pending; });
         setStatus(e, 'rendering');
         await renderAndReview(e, e.pending);
         if (e.status !== 'ready') throw new Error(e.review?.issues?.[0] || 'It didn’t pass the quality check.');
@@ -168,6 +170,30 @@
     await walkthrough(list.filter((e) => e.status === 'ready'), list.filter((e) => e.status === 'failed'));
   }
 
+  /* Before building a change, look at it properly: what the buyer painted is only a hint. Go to that spot, turn so
+     the whole fixture is in view, and have the agent find everything the change touches in that fresh view. */
+  async function reframe(e) {
+    const src = e.pending;
+    if (!src?.pose || !e.world?.center) return src;
+    const r = src.targetRect || src.rect, W = src.pose.W, Hh = src.pose.H, m = 0.07;
+    const clipped = !r || r.x < m * W || r.y < m * Hh || r.x + r.w > (1 - m) * W || r.y + r.h > (1 - m) * Hh;
+    const cramped = r && (r.w > 0.8 * W || r.h > 0.8 * Hh);
+    if (!clipped && !cramped) return src;          // already framed with room around it
+    await walkTo(src.pose.sweep);
+    const c = e.world.center, p = poseCache.position;
+    const dx = c.x - p.x, dy = c.y - p.y, dz = c.z - p.z;
+    await lookAt({ x: Math.atan2(dy, Math.hypot(dx, dz)) * 180 / Math.PI, y: Math.atan2(-dx, -dz) * 180 / Math.PI }, 140);
+    await sleep(700);
+    const sel = await makeSelection({ x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, null, { silent: true, whole: true });
+    const { finding, objects } = await planSelection(sel, 'Change: ' + e.title + (e.custom ? ' (' + e.custom + ')' : '') +
+      '. Find the ' + (e.item || 'fixture') + ' this applies to. box_2d must enclose everything the change touches: the whole ' +
+      'fixture and its surround from the floor to its top edge, trim, and the floor right in front of it.');
+    if (!finding) return src;
+    const t = editTarget(sel, finding, e.title, objects);
+    if (!t?.source?.rect) return src;
+    e.world = t.world || e.world;
+    return t.source;
+  }
   function narration(e) {
     const what = e.option ? e.option.name : e.title;
     const why = e.advice ? ' ' + e.advice : '';

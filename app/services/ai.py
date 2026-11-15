@@ -277,7 +277,9 @@ If a sink or vanity is described as wheelchair inaccessible, first address forwa
 Pick scope "roll_under_sink" for that change. {ROLL_UNDER}
 If the buyer wants all cabinets removed, design an open counter and basin with discreet supports, fully clear
 below. Do not add side cabinets, doors, shelves, plinths or furniture-style frames.
-box_2d must tightly enclose the real fixture, including its existing countertop and cabinet, without adjacent fixtures.
+box_2d must enclose the real fixture AND everything the change touches: for a tub or shower the whole enclosure and
+its surround from the floor up to the top of the surround/tile, plus the threshold; for a vanity its countertop and
+cabinet. Do not include unrelated neighboring fixtures.
 For a roll-under sink also give edit_box_2d covering only the cabinet below the basin and the immediate floor
 inside the opening. Exclude the basin, faucet, mirror and countertop.
 Use edit_polygon_2d for irregular cabinet silhouettes. Trace the cabinet edges and immediately exposed floor

@@ -172,7 +172,15 @@ async function lookAt(rot, speed = 10000) {     // speed in degrees/second; ~90 
     await soon(sdk.Camera.rotate(-dy, dx, { speed }), ms + 2500); await sleep(k ? 250 : Math.max(250, ms * 0.15));
     speed = Math.max(speed, 300);   // small corrections can be quick
   }
-  const { dy, dx } = off(); return Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5;
+  let { dy, dx } = off();
+  if (Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5) return true;
+  // The animated turn can stall (busy or background tab). Setting the view at this scan point always lands.
+  if (poseCache?.sweep) {
+    await soon(sdk.Sweep.moveTo(poseCache.sweep, { rotation: { x: rot.x, y: rot.y }, transition: sdk.Sweep.Transition.INSTANT }), 3000);
+    await sleep(200);
+    ({ dy, dx } = off());
+  }
+  return Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5;
 }
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.max(0, Math.round(p * (s.length - 1))))]; };
 async function sampleSelection(r, pose) {
@@ -516,7 +524,20 @@ function activeEdit(e, revision) {
 async function renderAngle(e, angle, revision, ref = null) {
   let fix = null;
   const { frame, pose, rect, extra } = angle;
-  const region = e.scope === 'roll_under_sink' ? rect : paddedRect(rect, pose);
+  // Edit generously around the fixture: surrounds, trim, wall above and floor in front change with it, and the
+  // wide feathered margin lets the new work fade into the real photo instead of ending at a hard box.
+  const big = /shower|tub|bath|vanity|cabinet|counter|door|wall|floor|stair|ramp|island|closet|bar\b|kitchen|surround/i.test((e.title || '') + ' ' + (e.item || ''));
+  // generous above and below (surround, ceiling line, floor in front), tight to the sides where neighbors sit
+  const vpad = (big ? 0.15 : 0.07) * Math.max(rect.w, rect.h), hpad = (big ? 0.04 : 0.05) * Math.max(rect.w, rect.h);
+  let region = rect;
+  if (e.scope !== 'roll_under_sink') {
+    const x = Math.max(0, rect.x - hpad), y = Math.max(0, rect.y - vpad);
+    region = { x, y, w: Math.min(pose.W, rect.x + rect.w + hpad) - x, h: Math.min(pose.H, rect.y + rect.h + vpad) - y };
+  }
+  if (/shower|tub|bath/i.test((e.title || '') + ' ' + (e.item || '')) && e.scope !== 'roll_under_sink') {
+    const top = Math.max(0, region.y - region.h * 0.35);       // surrounds run up toward the ceiling
+    region = { ...region, y: top, h: region.y + region.h - top };
+  }
   const norm = [region.x / pose.W, region.y / pose.H, (region.x + region.w) / pose.W, (region.y + region.h) / pose.H];
   const task = taskText(e);
   for (let attempt = 0; attempt < (extra ? 2 : 3); attempt++) {

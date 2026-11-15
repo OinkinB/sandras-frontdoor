@@ -35,6 +35,11 @@ Requirements:
   flanges, never on glass, a glass shower door, a mirror or a window. Behind a glass shower door, put it on the tile
   wall seen through the glass. Every existing handle, faucet, door, hinge and fixture stays exactly as it is unless
   the task says to change it.
+- The white area is deliberately generous. Rebuild EVERYTHING the change touches inside it so the result is complete:
+  the whole fixture, its surround or tile up to its real top edge, trim, the wall behind it and the floor in front.
+  Toward the edges of the white area, match the original photo exactly (same wall paint, floor planks, baseboard,
+  lighting) so the edit fades in with no visible box, seam or step. Neighboring fixtures that are partly inside the
+  white area (a toilet, vanity, door) stay exactly where they are, pixel-aligned; never move or redraw them.
 - Do not change anything outside the white mask. No text, labels, outlines or watermarks.
 {ref}Return the full edited photo at the same framing."""
 
@@ -138,7 +143,7 @@ def render(full_jpeg: bytes, rect: list[float], task: str, out_dir: Path, ref_pn
         out = Image.merge("RGB", [ch_.point(lambda v, k=k: min(255, v * k)) for ch_, k in zip(out.split(), gains)])
 
     # Feather inward. Generated pixels must never cover the counter, wall, or doorway outside the mask.
-    feather = max(2, min(8, int(0.015 * max(sw, sh) * (2.2 if small else 1))))
+    feather = max(3, min(36, int(0.03 * max(sw, sh)))) if not small else max(2, min(10, int(0.033 * max(sw, sh))))
     alpha = ImageChops.multiply(mask, mask.filter(ImageFilter.GaussianBlur(feather)))
     patch = out.copy(); patch.putalpha(alpha)
     bbox = alpha.point(lambda v: 255 if v > 3 else 0).getbbox() or (0, 0, cw, ch)
