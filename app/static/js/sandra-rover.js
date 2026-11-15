@@ -289,15 +289,7 @@ function roverSay(text, ms = 5200) {
   if (!q || q.z > 1 || q.z < -1 || q.x < 0 || q.x > W || q.y < 0 || q.y > Hh) { sayEl.style.opacity = 0; return; }
   sayEl.style.left = q.x + 'px'; sayEl.style.top = q.y + 'px'; sayEl.style.opacity = 1;
 })();
-// Everything Sandra says in the chat she also says out loud, above her head.
-if (typeof bubble === 'function') {
-  const chatBubble = bubble;
-  bubble = function (html, who = 'ai', loc = null) {
-    const el = chatBubble(html, who, loc);
-    if (who === 'ai' && !/dots/.test(html)) roverSay(html);
-    return el;
-  };
-}
+// Sandra's words live in one card at the bottom of the screen; no second copy above her head.
 // track when the visitor moves the camera, so wandering never fights them
 setTimeout(function hook() {
   if (!sdk) return setTimeout(hook, 1000);

@@ -1,152 +1,44 @@
+/* FrontDoor: one light, monochrome look everywhere. Sandra (pink) is the only color. */
 :root {
-  color-scheme: dark;
-  --night: #090e10;
-  --panel: #101719;
-  --raised: #182124;
-  --line: #2a383a;
-  --ink: #e9f3ef;
-  --muted: #a0b4b3;
-  --signal: #81f1da;
-  --warning: #ffc386;
-  --chat-w: clamp(322px, 28vw, 410px);
+  color-scheme: light;
+  --night: #fafafa;
+  --panel: #ffffff;
+  --raised: #f4f4f5;
+  --line: #e7e7e9;
+  --ink: #0a0a0a;
+  --muted: #6b6b6b;
+  --signal: #0a0a0a;
+  --pink: #ff5fa2;
+  --pink-soft: #fff0f6;
+  --warning: #b45309;
   --mono: 'Space Mono', monospace;
 }
 .sandra-shell { background: var(--night); color: var(--ink); font-family: 'Instrument Sans', sans-serif; }
-#guide.hidden, #chat.hidden { display: none; }
-.sandra-shell :focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; }
+.sandra-shell :focus-visible { outline: 2px solid var(--pink); outline-offset: 3px; }
 .sandra-header { position: relative; z-index: 41; border-bottom: 1px solid var(--line); background: var(--night); flex: 0 0 auto; }
 .sandra-header > div { height: 57px; }
 .sandra-wordmark { display: flex; gap: 11px; align-items: center; font-size: 1.25rem; font-weight: 700; letter-spacing: -.04em; }
-.sandra-mark { display: inline-block; position: relative; flex: none; width: 30px; height: 30px; border-radius: 9px; background: #143431; border: 1px solid #367e74; }
-.sandra-mark::before, .sandra-mark::after { content: ''; position: absolute; top: 10px; width: 4px; height: 8px; border-radius: 2px; background: var(--signal); box-shadow: 0 0 8px #81f1da75; }
+.sandra-mark { display: inline-block; position: relative; flex: none; width: 30px; height: 30px; border-radius: 9px; background: var(--pink); box-shadow: 0 4px 14px -4px #ff5fa2aa; }
+.sandra-mark::before, .sandra-mark::after { content: ''; position: absolute; top: 10px; width: 4px; height: 8px; border-radius: 2px; background: #fff; }
 .sandra-mark::before { left: 8px; }.sandra-mark::after { right: 8px; }
 .sandra-nav { display: flex; gap: 1.15rem; font-size: .88rem; color: var(--muted); }
-.sandra-nav a:hover { color: var(--signal); }
-.sandra-primary, .sandra-secondary { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: 37px; border-radius: 8px; padding: .48rem .76rem; font-size: .86rem; font-weight: 700; line-height: 1.2; transition: background .18s, border-color .18s; }
-.sandra-primary { background: var(--signal); color: #0b2420; border: 1px solid transparent; }
-.sandra-primary:hover { background: #b0f9e9; }
-.sandra-secondary { border: 1px solid var(--line); color: var(--ink); background: var(--raised); }
-.sandra-secondary:hover { border-color: var(--signal); }
-.sandra-shell button:disabled { opacity: .55; cursor: default; }
-.sandra-shell .text-slate-500, .sandra-shell .text-slate-600, .sandra-shell .text-slate-400 { color: var(--muted); }
-.sandra-shell .text-slate-700, .sandra-shell .text-ink { color: var(--ink); }
-.sandra-shell .text-brand-600, .sandra-shell .text-brand-700, .sandra-shell .text-emerald-700 { color: var(--signal); }
-.sandra-shell select { color: var(--ink); background: var(--raised); }
-.sandra-shell .chip-btn { color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: .43rem .7rem; font-size: .84rem; }
-.sandra-shell .chip-btn[aria-pressed="true"] { background: #183832; color: var(--signal); border-color: #397768; }
-.sandra-shell .chip-btn[data-required="true"] { color: #0b2420; border-color: var(--signal); background: var(--signal); }
-.sandra-shell .status-yes, .sandra-shell .status-likely { color: var(--signal); }.sandra-shell .status-no { color: #ffaa9b; }
-.sandra-shell .border-slate-100, .sandra-shell .border-slate-200 { border-color: var(--line); }
-.sandra-shell .scroll-thin::-webkit-scrollbar-thumb { background: #3a5353; }
-.sandra-shell .bg-white, .sandra-shell [class~="bg-white/95"] { background-color: var(--panel); }
-.sandra-shell .bg-slate-100, .sandra-shell .bg-slate-200 { background-color: var(--raised); }
-.sandra-shell .bg-brand-50 { background-color: #163632; }
-.sandra-shell .bg-amber-50 { background-color: #36291d; color: #ffd3a1; }
-.sandra-shell .bg-emerald-50, .sandra-shell .bg-sky-50 { background-color: #153430; color: var(--signal); }
-
-.sandra-search { padding-top: clamp(1.5rem, 4vw, 4rem); padding-bottom: 3rem; }
-.search-hero { position: relative; overflow: hidden; min-height: 430px; background: #111f21; border: 1px solid var(--line); border-radius: 18px; }
-.search-hero-visual { position: absolute; inset: 0 0 0 34%; background: linear-gradient(140deg, #15352e, #182528 55%, #141a1a); }
-.search-hero-visual > img { width: 100%; height: 100%; object-fit: cover; opacity: .78; transition: opacity .45s; }
-.search-hero-visual > img.active { opacity: .78; }
-.search-hero-visual > div { position: absolute; inset: 0; background: linear-gradient(90deg, #111f21 3%, #111f21c5 29%, #111f2138 75%), linear-gradient(0deg,#111f21a6, transparent 48%); }
-.search-hero-copy { position: relative; z-index: 1; padding: clamp(1.5rem, 5vw, 4rem); width: min(100%, 720px); }
-.sandra-kicker { display: flex; align-items: center; gap: .55rem; text-transform: uppercase; font: .76rem var(--mono); letter-spacing: .16em; color: var(--signal); }
-.status-light { width: 7px; height: 7px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 12px #81f1da66; }
-.search-hero h1 { font-size: clamp(2.9rem, 6vw, 6rem); font-weight: 700; line-height: .94; letter-spacing: -.074em; margin: .8rem 0 1.1rem; }
-.search-hero-copy > p { color: #c5d8d3; font-size: 1.06rem; max-width: 38rem; }
-.sandra-input { display: flex; align-items: center; gap: .75rem; padding: .55rem; margin-top: 1.45rem; background: #0e1719; border: 1px solid #3b5658; border-radius: 11px; }
-.sandra-input textarea { background: none; flex: 1; min-width: 0; resize: vertical; color: var(--ink); padding: .55rem .48rem; font-size: .97rem; outline: none; }
-.sandra-input button { flex: none; white-space: nowrap; }
-.search-examples { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .84rem; }
-.search-examples button { border: 1px solid #3c5554; color: #d4e5df; padding: .31rem .55rem; background: #101c1d; border-radius: 5px; font-size: .8rem; }
-.search-examples button:hover { border-color: var(--signal); }
-#persona { margin-top: .6rem; font-size: .87rem; min-height: 1rem; }
-.search-preferences { border-block: 1px solid var(--line); padding: 1.2rem 0; margin-top: 1.65rem; }
-.search-preferences h2 { font-size: 1.02rem; font-weight: 700; }
-.search-preferences #chips { margin-top: .75rem; }
-.search-results { padding-top: 1.6rem; }
-.search-results h2 { font-size: clamp(1.45rem, 4vw, 2.3rem); font-weight: 700; letter-spacing: -.045em; }
-.search-results #result-sub, .search-sort { color: var(--muted); font-size: .9rem; }
-.search-sort select { padding: .37rem .45rem; border-radius: 6px; margin-inline-start: .35rem; border: 1px solid var(--line); }
-.home-card { border: 1px solid var(--line); }
-.home-card:hover { border-color: #556f6d; }
-.match-evidence { color: var(--signal); font-size: .84rem; margin-top: .45rem; }
+.sandra-nav a:hover { color: var(--ink); }
+.sandra-primary, .sandra-secondary { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: 36px; border-radius: 999px; padding: .45rem .95rem; font-size: .86rem; font-weight: 600; line-height: 1.2; transition: background .18s, border-color .18s, transform .18s; }
+.sandra-primary { background: var(--ink); color: #fff; border: 1px solid var(--ink); }
+.sandra-primary:hover { transform: translateY(-1px); }
+.sandra-secondary { border: 1px solid #dcdcdc; color: var(--ink); background: #fff; }
+.sandra-secondary:hover { border-color: var(--ink); }
+.sandra-shell button:disabled { opacity: .5; cursor: default; }
+.sandra-shell .chip-btn { color: #4a4a4a; background: transparent; border: 1px solid #dcdcdc; border-radius: 999px; padding: .4rem .85rem; font-size: .85rem; }
+.sandra-shell .chip-btn[aria-pressed="true"] { background: var(--ink); color: #fff; border-color: var(--ink); }
+.sandra-shell .chip-btn[data-required="true"] { color: #fff; border-color: var(--pink); background: var(--pink); }
+.status-yes{color:#15803d}.status-likely{color:#0e7490}.status-unknown{color:#94a3b8}.status-no{color:#b91c1c}
+.home-card { border: 1px solid var(--line); background: #fff; color: var(--ink); }
+.home-card:hover { border-color: var(--ink); }
+.match-evidence { color: #15803d; font-size: .84rem; margin-top: .45rem; }
 .match-evidence.pending { color: var(--warning); }
 .card-meter { border-top: 1px solid var(--line); color: var(--ink); padding-top: .65rem; margin-top: .6rem; display: flex; justify-content: space-between; font-size: .87rem; }
 
-.sandra-tour { --chat-w: clamp(322px, 28vw, 410px); }
-.sandra-tour.guide-min { --chat-w: 0px; }
-.listing-bar { border-bottom: 1px solid var(--line); background: var(--panel); }
-.listing-bar > div { height: 62px; }
-#stage { background: #101819; }
-#showcase, #overlay { width: calc(100% - var(--chat-w)); right: auto; }
-.sandra-scout { width: calc(100% - var(--chat-w)) !important; }
-.sandra-dock { position: absolute; z-index: 40; top: 0; right: 0; bottom: 0; width: var(--chat-w); display: flex; flex-direction: column; overflow: hidden; background: var(--night); border-left: 1px solid var(--line); }
-.sandra-dock-head { display: flex; align-items: center; padding: 1rem; gap: .67rem; border-bottom: 1px solid var(--line); }
-.sandra-dock-head h2 { font-size: 1.28rem; line-height: 1.11; letter-spacing: -.03em; font-weight: 700; }
-#guide-sub { font: .69rem var(--mono); color: var(--signal); margin-top: .2rem; }
-#guide-min { min-width: 37px; padding-inline: .45rem; }
-.sandra-dock-controls { display: flex; flex-wrap: wrap; gap: .4rem; padding: .75rem 1rem .5rem; }
-.sandra-dock-controls .sandra-secondary { min-height: 33px; font-size: .8rem; }
-#guide-stop, .sandra-guiding #guide-title-run { display: none; }
-.sandra-guiding #guide-stop { display: inline-flex; }
-.sandra-dock-task { flex: 0 1 auto; max-height: 43%; overflow: auto; padding: .3rem 1rem; }
-.sandra-task, #guide-task .msg-in > div { background: var(--raised); color: var(--ink); border: 1px solid #3d5a56; border-radius: 9px; padding: .85rem .88rem; font-size: .91rem; }
-.sandra-task strong, #guide-task strong { display: block; font-size: 1.12rem; line-height: 1.2; letter-spacing: -.02em; }
-.sandra-task p, #guide-task p { margin-top: .48rem; color: #c0d3cf; line-height: 1.42; }
-.sandra-room-label { color: var(--signal); font: .69rem var(--mono); margin-bottom: .4rem; text-transform: uppercase; }
-#guide-task .sandra-price { color: var(--signal); }
-.decision-buttons { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .75rem; }
-.decision-buttons button { min-height: 33px; font-size: .8rem; }
-.sandra-coverage { display: flex; gap: .45rem; align-items: center; justify-content: space-between; margin-inline: 1rem; padding-block: .38rem; color: var(--muted); }
-.sandra-coverage[hidden] { display: none; }
-.sandra-coverage p { font-size: .75rem; line-height: 1.24; }
-.sandra-coverage button { min-height: 29px; flex: none; font-size: .76rem; }
-.sandra-job-stack { max-height: 20%; overflow: auto; margin: .15rem 1rem .35rem; display: grid; gap: .45rem; }
-.sandra-job-stack:empty { display: none; }
-.sandra-history-head { padding: .57rem 1rem; border-top: 1px solid var(--line); display: flex; justify-content: space-between; font-size: .79rem; color: var(--muted); }
-.sandra-history-head button:hover { color: var(--signal); }
-.sandra-history { flex: 1; min-height: 48px; overflow: auto; padding: .2rem 1rem .7rem; display: flex; flex-direction: column; gap: .5rem; }
-.sandra-history .msg-in > div { color: var(--ink); background: var(--panel); border-color: var(--line); font-size: .88rem; }
-.sandra-history .msg-in.justify-end > div { background: #173632; }
-.sandra-composer { padding: .65rem 1rem .85rem; border-top: 1px solid var(--line); margin-top: auto; }
-#chat-form { background: var(--panel); border: 1px solid #395252; border-radius: 9px; }
-.sandra-send { background: var(--signal); color: #132b28; border-radius: 6px; width: 31px; height: 31px; font-size: 1.1rem; font-weight: 700; }
-.sandra-tour .drawer, .sandra-tour .job { background: #101719f7; color: var(--ink); border: 1px solid var(--line); }
-.sandra-tour .drawer-head { border-color: var(--line); }
-.sandra-tour .job-bar { background: var(--line); }.sandra-tour .job-bar>div { background: var(--signal); }
-.sandra-tour .job-bar.busy>div { background: linear-gradient(90deg,#2d7d6e,var(--signal),#2d7d6e); background-size: 200% 100%; }
-.sandra-tour .spot { border-color: var(--signal); border-radius: 5px; animation: none; box-shadow: 0 0 0 9999px #10161938, 0 0 22px #81f1da79; }
-.sandra-tour .spot .sel-label { background: #153e38; border: 1px solid var(--signal); }
-.sandra-tour .alert { border-left-color: var(--signal); }
-.sandra-tour .alert:hover { background: #18302e; }
-.sandra-tour .alert.seen { border-left-color: #6e918c; }
-.sandra-object-list { display: grid; gap: .3rem; margin-top: .55rem; }
-.sandra-object-list button { text-align: left; padding: .32rem .48rem; background: #172b2b; color: #d9ebe6; border-radius: 5px; }
-.sandra-object-list button:hover { color: var(--signal); }
-@media (max-width: 760px) {
-  .sandra-tour { --chat-w: 0px; --dock-h: min(48%, 340px); }
-  .sandra-tour.guide-min { --dock-h: 0px; }
-  .sandra-dock { top: auto; height: var(--dock-h); left: 0; width: 100%; border-left: 0; border-top: 1px solid var(--line); }
-  #showcase, #overlay, .sandra-scout { height: calc(100% - var(--dock-h)) !important; bottom: auto; }
-  .sandra-tour .tour-controls { bottom: calc(var(--dock-h) + 8px); }
-  .sandra-tour .drawer { bottom: calc(var(--dock-h) + 10px); }
-  .sandra-dock-head { padding: .48rem .7rem; }.sandra-dock-controls { padding: .4rem .7rem .25rem; }
-  .sandra-dock-task { padding: .25rem .7rem; max-height: 42%; }
-  .sandra-history-head { padding: .28rem .7rem; }.sandra-history { min-height: 0; padding-inline: .7rem; }
-  .sandra-composer { padding: .32rem .7rem; }.sandra-coverage { margin-inline: .7rem; }
-  .sandra-coverage p:empty { display: none; }
-  .listing-bar > div { height: 56px; gap: .35rem; }
-  .listing-bar #agent-run { display: none; }
-  .search-hero-visual { inset-inline-start: 0; opacity: .42; }
-  .sandra-input { align-items: stretch; flex-direction: column; gap: .15rem; }
-  .sandra-input textarea { width: 100%; }.sandra-input button { align-self: flex-start; }
-}
 @media (prefers-reduced-motion: reduce) {
   .sandra-shell *, .sandra-shell *::before, .sandra-shell *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
 }
-
-/* Sandra is pink everywhere she appears */
-.sandra-mark { background: #ff5fa2 !important; border-color: #ff8dc0 !important; box-shadow: 0 4px 14px -4px #ff5fa2aa; }
-.sandra-mark::before, .sandra-mark::after { background: #fff !important; box-shadow: none !important; }

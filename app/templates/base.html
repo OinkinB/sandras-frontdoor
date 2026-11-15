@@ -10,17 +10,18 @@
   <script>
     tailwind.config = { theme: { extend: {
       fontFamily: { sans: ['Instrument Sans', 'system-ui', 'sans-serif'] },
-      colors: { brand: { 50:'#19312e',100:'#23514a',200:'#285c53',400:'#75e5cf',500:'#65dac2',600:'#307669',700:'#245a52',900:'#163532' },
-                ink: '#101719' },
+      colors: { brand: { 50:'#fff0f6',100:'#ffe0ee',200:'#ffc2dd',400:'#ff8fbf',500:'#ff5fa2',600:'#0a0a0a',700:'#c2185b',900:'#4a0d27' },
+                ink: '#0a0a0a' },
       boxShadow: { card: '0 8px 36px rgba(0,0,0,.17)' }
     } } }
   </script>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/sandra.css') }}">
   <script src="{{ url_for('static', filename='js/report.js') }}"></script>
+  {% block head %}{% endblock %}
 </head>
 <body class="sandra-shell font-sans antialiased {% block bodyclass %}{% endblock %}">
-  <header class="sandra-header">
+  {% block header %}<header class="sandra-header">
     <div class="max-w-[1500px] mx-auto px-4 md:px-8 flex items-center gap-6">
       <a href="/" class="sandra-wordmark"><span class="sandra-mark" aria-hidden="true"></span><span>FrontDoor</span></a>
       <nav class="sandra-nav" aria-label="Property search">
@@ -28,7 +29,7 @@
       </nav>
       <div id="report-slot" class="ml-auto"></div>
     </div>
-  </header>
+  </header>{% endblock %}
   {% block body %}{% endblock %}
   {% block scripts %}{% endblock %}
 </body>

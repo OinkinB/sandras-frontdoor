@@ -31,6 +31,10 @@ Requirements:
 - Match this photo's lighting direction, exposure, white balance, shadows, reflections, grain and lens softness.
 - Correct real-world scale for the room; the new item must sit on the real floor/wall with contact shadows.
 - Where something is removed, fill with the surrounding floor/wall/tile continuing naturally.
+- Anything added (grab bar, rail, shelf, light) is mounted on a solid wall or tile surface with visible mounting
+  flanges, never on glass, a glass shower door, a mirror or a window. Behind a glass shower door, put it on the tile
+  wall seen through the glass. Every existing handle, faucet, door, hinge and fixture stays exactly as it is unless
+  the task says to change it.
 - Do not change anything outside the white mask. No text, labels, outlines or watermarks.
 {ref}Return the full edited photo at the same framing."""
 

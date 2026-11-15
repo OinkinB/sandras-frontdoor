@@ -149,6 +149,17 @@ Generated image quality still needs a provider-backed check.
 
 ---
 
+### The tour, in the buyer's hands
+The tour is full-screen Matterport with the listing small at top left and Sandra at bottom center: one card (one
+question or answer at a time) above one input. Flow (`app/static/js/sandra-flow.js`):
+1. **Who is it for?** Sandra asks first (multi-select or your own words) and never assumes a wheelchair; older age maps
+   to aging-in-place changes. Saved per browser; "More → Change who it's for" edits it.
+2. **Explore at your own pace.** Sandra never moves the camera here. When you settle in a new room she looks at what you
+   see and may point out one thing ("Add to my list" / "No thanks"). Type a change, or tap ✎ and paint over anything
+   (a real brush; Ctrl+Z removes the last stroke). Each change is understood and priced right away and goes on your list.
+3. **Make my changes.** Sandra builds the whole list (render, review, auto-fix), then walks you through each change like a
+   realtor: she goes there, frames it, explains it with its price, and you pick Next / Remove this / I'll look around.
+
 ### Empty rooms (automatic)
 Furnished listings are hard to picture as your own. The moment you arrive at a scan point, Sandra captures its
 360° panorama (`Renderer.takeEquirectangular`), the image model removes furniture and belongings while keeping

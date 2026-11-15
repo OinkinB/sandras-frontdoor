@@ -97,8 +97,8 @@
         const head = await fetch(`/api/home/${HID}/empty/${id}?meta=1`, { cache: 'no-store' });   // made already?
         let ok = head.ok, yaw = ok ? +((await head.json()).yaw || 0) : 0;
         if (!ok) {
-          status('Sandra is clearing out the furniture…', true);
-          if (typeof roverSay === 'function') roverSay('Let me clear this room so you can see the space.', 4500);
+          status('Clearing furniture…', true);
+          if (typeof roverSay === 'function') roverSay('Clearing this room so you can see the space.', 4500);
           const shot = await capture(); yaw = shot.yaw;
           const r = await fetch(`/api/home/${HID}/empty/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(shot) });
           ok = r.ok;
@@ -121,19 +121,19 @@
   }
 
   function ui() {
-    const host = document.getElementById('showcase')?.parentElement;
-    if (!host || document.getElementById('empty-status')) return;
+    if (document.getElementById('empty-status')) return;
+    const row = document.querySelector('.tl-row');
     const box = document.createElement('div');
     box.id = 'empty-status';
+    box.className = row ? 'tl-pill' : '';
     box.innerHTML = '<span class="dot"></span><span class="txt">Empty room</span><button id="empty-toggle" type="button"></button>';
-    host.appendChild(box);
+    (row || document.getElementById('showcase').parentElement).appendChild(box);
     const css = document.createElement('style');
-    css.textContent = `#empty-status{position:absolute;left:16px;top:60px;z-index:30;display:flex;align-items:center;gap:.5rem;
-      background:rgba(12,12,16,.72);backdrop-filter:blur(8px);color:#fff;font-size:.8rem;padding:.35rem .4rem .35rem .8rem;border-radius:999px}
+    css.textContent = `#empty-status{gap:.45rem;padding-right:4px}
       #empty-status .dot{width:8px;height:8px;border-radius:50%;background:#ff5fa2}
       #empty-status.busy .dot{animation:emptyPulse 1s ease-in-out infinite}
       @keyframes emptyPulse{50%{opacity:.25;transform:scale(1.6)}}
-      #empty-toggle{background:#fff;color:#111;border-radius:999px;padding:.2rem .7rem;font-weight:600}
+      #empty-toggle{background:#0a0a0a;color:#fff;border-radius:999px;padding:.15rem .65rem;font-weight:600;font-size:.75rem;height:24px}
       @media (prefers-reduced-motion: reduce){#empty-status.busy .dot{animation:none}}`;
     document.head.appendChild(css);
     document.getElementById('empty-toggle').onclick = () => toggle(!st.on);

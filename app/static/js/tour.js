@@ -13,7 +13,7 @@ const H = window.HOME;
 const NEEDS = (new URLSearchParams(location.search).get('needs') || '').split(',').filter(Boolean);
 const STORE = `frontdoor-v3-${H.id}`;
 const BUDGET = (() => { try { return +sessionStorage.getItem('fd-budget') || 0; } catch { return 0; } })();
-const PERSONA = (() => { try { return sessionStorage.getItem('fd-persona') || ''; } catch { return ''; } })();
+let PERSONA = (() => { try { return sessionStorage.getItem('fd-persona') || ''; } catch { return ''; } })();
 const $ = (s, r = document) => r.querySelector(s);
 const money = (n) => '$' + Math.round(n || 0).toLocaleString();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -55,7 +55,7 @@ iframe.addEventListener('load', async () => {
     sdk.Sweep.current.subscribe((s) => { stationedSweep = s.id || s.sid || ''; refreshVisibility(); scheduleCoverage(); });
     sdk.Camera.pose.subscribe(onPose);
     await restoreEdits();
-    hint('Drag to look around. Click <b>✎ Change something</b> to reimagine any spot.', 6000);
+    hint('Drag to look around. Tell Sandra what you’d change, or tap ✎ and paint over it.', 6000);
     welcome();
   } catch (e) { console.error(e); hint('3D tour failed to load: ' + (e.message || e)); }
 });
@@ -566,7 +566,8 @@ async function renderNearby(e, angles, revision, ref) {
 }
 
 /* ================= processing window ================= */
-const STEPS = { understanding: ['Understanding your request', 15], designing: ['Choosing the product & price', 35], rendering: ['Rendering it into your home', 60],
+let QUEUE_MODE = true;
+const STEPS = { queued: ['On your list', 40], understanding: ['Understanding your request', 15], designing: ['Choosing the product & price', 35], rendering: ['Rendering it into your home', 60],
   checking: ['Checking the result looks right', 88], fixing: ['Fixing what the check found', 70], ready: ['Ready', 100], failed: ['Could not finish', 100] };
 function jobCard({ id, title, step, pct, busy, thumb }) {
   let el = document.getElementById('job-' + id);
@@ -630,9 +631,7 @@ function ask(html, buttons, loc = null) {
     const finish = (key) => {
       if (tourDecision === finish) tourDecision = null;
       draftReply = null;
-      el.querySelectorAll('button').forEach((button) => { button.disabled = true; });
-      el.querySelector('.decision-buttons')?.remove();
-      if (pane?.contains(el)) $('#chat').appendChild(el);
+      el.remove();          // one message at a time: the answered question leaves the card
       resolve(key);
     };
     tourDecision = finish;
@@ -704,8 +703,17 @@ async function command(sel, instruction, label, finding = null, objects = []) {
     }
     const options = finding.options || [], option = options[Math.min(1, options.length - 1)] || null;
     setStatus(e, 'designing', { ...identity, title: finding.title || e.title, action: finding.action || 'replace',
-      item: finding.item || '', options, option, cost: option?.total || 0,
+      item: finding.item || '', options, option, cost: option?.total || 0, advice: finding.advice || finding.reason || '',
       custom: finding.guided && !finding.revised ? '' : instruction });
+    if (QUEUE_MODE && !finding.now) {
+      // The buyer keeps touring; Sandra builds everything at once later and then walks them through it.
+      e.pending = source;
+      setStatus(e, 'queued');
+      const n = edits.filter((x) => x.status === 'queued').length;
+      say('<strong>Added: ' + esc(e.title) + '</strong><p>' + (option ? 'About ' + money(option.total) + ' installed. ' : '') +
+        n + ' on your list. Keep looking around, or tap <b>Make my changes</b> when you’re ready.</p>');
+      return e;
+    }
     await renderAndReview(e, source);
     if (duplicate && e.status === 'ready') removeEdit(duplicate.id, true);
   } catch (err) {
@@ -754,66 +762,127 @@ let drag = null, tool = 'lasso';
 function setMode(m) {
   mode = m;
   overlay.style.pointerEvents = m === 'select' ? 'auto' : 'none';
-  overlay.style.cursor = m === 'select' ? 'crosshair' : '';
-  $('#mode-select').className = 'px-4 py-2 rounded-full ' + (m === 'select' ? 'bg-brand-600 text-white' : '');
-  $('#mode-walk').className = 'px-4 py-2 rounded-full ' + (m === 'walk' ? 'bg-ink text-white' : '');
-  $('#tool-pick').classList.toggle('hidden', m !== 'select');
-  if (m === 'select') { stopAgent(); hint('Circle what you want to change, loosely is fine. Then pick what to do.', 6000); }
-  else hideMenu();
+  overlay.classList.toggle('paint-cursor', m === 'select');
+  $('#mode-select').setAttribute('aria-pressed', String(m === 'select'));
+  if (m === 'select') {
+    stopAgent(); brushSurface();
+    if (!brush.strokes.length) hint('Paint over what you want to change. Then type what to do with it.', 6000);
+  } else { hideMenu(); clearBrush(); }
 }
-function setTool(t) {
-  tool = t;
-  document.querySelectorAll('[data-tool-pick]').forEach((b) => b.className = 'px-3 py-1.5 rounded-full ' + (b.dataset.toolPick === t ? 'bg-ink text-white' : ''));
-}
-document.querySelectorAll('[data-tool-pick]').forEach((b) => b.onclick = () => setTool(b.dataset.toolPick));
+function setTool() {}
 $('#mode-walk').onclick = () => setMode('walk');
-$('#mode-select').onclick = () => setMode('select');
+$('#mode-select').onclick = () => setMode(mode === 'select' ? 'walk' : 'select');
 let peek = false;
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); if (brush.strokes.length) { brush.strokes.pop(); drawBrush(); } else undo(); return; }
   if (e.key === 's' || e.key === 'S') setMode('select');
   if (e.key === 'w' || e.key === 'W') setMode('walk');
   if ((e.key === 'b' || e.key === 'B') && !e.repeat && view === 'after') { peek = true; setView('orig'); }
-  if (e.key === 'Escape') { clearSelections(); closeDrawers(); }
+  if (e.key === 'Escape') { clearSelections(); closeDrawers(); setMode('walk'); }
 });
 document.addEventListener('keyup', (e) => { if ((e.key === 'b' || e.key === 'B') && peek) { peek = false; setView('after'); } });
+
+/* ---- the brush: paint over what you mean, like a highlighter ---- */
+const brush = { strokes: [], canvas: null, ctx: null, cursor: null, active: null };
+const brushR = () => Math.max(12, Math.min(30, overlay.clientWidth * 0.018));
+function brushSurface() {
+  if (!brush.canvas) {
+    brush.canvas = document.createElement('canvas'); brush.canvas.id = 'brush';
+    brush.cursor = document.createElement('div'); brush.cursor.id = 'brush-cursor';
+    overlay.append(brush.canvas, brush.cursor);
+    brush.ctx = brush.canvas.getContext('2d');
+  }
+  const k = devicePixelRatio || 1, W = overlay.clientWidth, Hh = overlay.clientHeight;
+  if (brush.canvas.width !== Math.round(W * k)) { brush.canvas.width = Math.round(W * k); brush.canvas.height = Math.round(Hh * k); drawBrush(); }
+}
+function drawBrush() {
+  if (!brush.ctx) return;
+  const c = brush.ctx, k = devicePixelRatio || 1;
+  c.setTransform(k, 0, 0, k, 0, 0); c.clearRect(0, 0, brush.canvas.width, brush.canvas.height);
+  c.strokeStyle = c.fillStyle = '#ff5fa2'; c.lineCap = c.lineJoin = 'round';
+  for (const s of brush.strokes) {
+    c.lineWidth = s.r * 2; c.beginPath();
+    s.pts.forEach(([x, y], i) => (i ? c.lineTo(x, y) : c.moveTo(x, y)));
+    if (s.pts.length === 1) { c.arc(s.pts[0][0], s.pts[0][1], s.r, 0, Math.PI * 2); c.fill(); } else c.stroke();
+  }
+}
+function clearBrush() { brush.strokes = []; brush.active = null; drawBrush(); }
+function hull(points) {       // convex hull (monotone chain)
+  const p = [...points].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (p.length < 3) return p;
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const q of p) { while (lo.length > 1 && cross(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q); }
+  for (const q of p.reverse()) { while (up.length > 1 && cross(up[up.length - 2], up[up.length - 1], q) <= 0) up.pop(); up.push(q); }
+  return lo.slice(0, -1).concat(up.slice(0, -1));
+}
+function brushSelection() {     // the painted area -> outline polygon + bounds
+  const pts = [];
+  for (const s of brush.strokes) s.pts.forEach(([x, y], i) => {
+    if (i % 2 && i !== s.pts.length - 1) return;
+    for (let a = 0; a < 8; a++) pts.push([x + Math.cos(a * Math.PI / 4) * s.r, y + Math.sin(a * Math.PI / 4) * s.r]);
+  });
+  if (!pts.length) return null;
+  const W = overlay.clientWidth, Hh = overlay.clientHeight;
+  const poly = hull(pts).map(([x, y]) => [Math.max(0, Math.min(W, x)), Math.max(0, Math.min(Hh, y))]);
+  const xs = poly.map((p) => p[0]), ys = poly.map((p) => p[1]);
+  return { r: { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) }, poly };
+}
 const svgNS = 'http://www.w3.org/2000/svg';
 overlay.addEventListener('pointerdown', (e) => {
-  if (mode !== 'select' || !sdk || e.target.closest('#sel-menu')) return;
-  const b = overlay.getBoundingClientRect(), x = e.clientX - b.left, y = e.clientY - b.top;
-  hideMenu();
-  drag = { x0: x, y0: y, pts: [[x, y]], add: e.shiftKey || e.ctrlKey };
-  if (tool === 'box') { drag.el = document.createElement('div'); drag.el.className = 'marquee'; overlay.appendChild(drag.el); }
-  else {
-    drag.el = document.createElementNS(svgNS, 'svg'); drag.el.setAttribute('class', 'absolute inset-0 w-full h-full pointer-events-none');
-    drag.path = document.createElementNS(svgNS, 'path');
-    drag.path.setAttribute('fill', 'rgba(124,92,255,.15)'); drag.path.setAttribute('stroke', '#7c5cff'); drag.path.setAttribute('stroke-width', '3');
-    drag.el.appendChild(drag.path); overlay.appendChild(drag.el);
-  }
+  if (mode !== 'select' || !sdk || e.button > 0 || e.target.closest('#sel-menu')) return;
+  brushSurface();
+  const b = overlay.getBoundingClientRect();
+  brush.active = { r: brushR(), pts: [[e.clientX - b.left, e.clientY - b.top]] };
+  brush.strokes.push(brush.active); drawBrush();
   overlay.setPointerCapture(e.pointerId);
 });
 overlay.addEventListener('pointermove', (e) => {
-  if (!drag) return;
   const b = overlay.getBoundingClientRect(), x = e.clientX - b.left, y = e.clientY - b.top;
-  if (tool === 'box') Object.assign(drag.el.style, { left: Math.min(x, drag.x0) + 'px', top: Math.min(y, drag.y0) + 'px', width: Math.abs(x - drag.x0) + 'px', height: Math.abs(y - drag.y0) + 'px' });
-  else { drag.pts.push([x, y]); drag.path.setAttribute('d', 'M' + drag.pts.map((p) => p.join(',')).join('L') + 'Z'); }
-  drag.x1 = x; drag.y1 = y;
+  if (brush.cursor && mode === 'select') {
+    const r = brushR();
+    Object.assign(brush.cursor.style, { left: x + 'px', top: y + 'px', width: r * 2 + 'px', height: r * 2 + 'px' });
+  }
+  if (!brush.active) return;
+  const last = brush.active.pts[brush.active.pts.length - 1];
+  if (Math.hypot(x - last[0], y - last[1]) < 3) return;
+  brush.active.pts.push([x, y]); drawBrush();
 });
-overlay.addEventListener('pointerup', async () => {
-  if (!drag) return;
-  const d = drag; drag = null; d.el.remove();
-  let poly = null, r;
-  if (tool === 'lasso' && d.pts.length > 6) {
-    poly = d.pts;
-    const xs = poly.map((p) => p[0]), ys = poly.map((p) => p[1]);
-    r = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
-  } else r = { x: Math.min(d.x0, d.x1 ?? d.x0), y: Math.min(d.y0, d.y1 ?? d.y0), w: Math.abs((d.x1 ?? d.x0) - d.x0), h: Math.abs((d.y1 ?? d.y0) - d.y0) };
-  if (r.w < 14 || r.h < 14) { r = { x: d.x0 - 80, y: d.y0 - 80, w: 160, h: 160 }; poly = null; }
-  if (!d.add) clearSelections();
-  try { await makeSelection(r, poly); }
-  catch (err) { hint(esc(err.message), 5000); }
+overlay.addEventListener('pointerup', () => {
+  if (!brush.active) return;
+  brush.active = null;
+  paintedPrompt();
 });
+// After painting: one question, with the quickest answers as buttons; typing works too.
+function paintedPrompt() {
+  if (tourDecision) return;
+  const el = document.createElement('div');
+  el.className = 'msg-in';
+  el.innerHTML = '<strong>What should happen to what you painted?</strong><p>Type it below, or pick one. Paint more to add to it.</p>' +
+    '<div class="choice-chips"><button data-q="Remove this completely">Remove it</button>' +
+    '<button data-q="Make this easier to use for my needs">Make it work for me</button>' +
+    '<button data-q="replace">Replace it with…</button><button data-q="clear">Clear paint</button></div>';
+  el.querySelectorAll('[data-q]').forEach((b) => b.onclick = () => {
+    const q = b.dataset.q;
+    if (q === 'clear') { clearBrush(); setCard(null); return; }
+    if (q === 'replace') { $('#chat-input').value = 'Replace it with '; $('#chat-input').focus(); return; }
+    submitPainted(q);
+  });
+  setCard(el);
+  $('#chat-input').focus();
+}
+async function submitPainted(text) {
+  const area = brushSelection();
+  if (!area) return false;
+  setCard(null);
+  try {
+    const sel = await makeSelection(area.r, area.poly, { silent: true });
+    clearBrush(); setMode('walk');
+    command(sel, text, text);
+  } catch (err) { hint(esc(err.message), 5000); }
+  return true;
+}
 function cropOf(img, r, W, max = 640) {
   const k = img.naturalWidth / W, c = document.createElement('canvas');
   const s = Math.min(1, max / (Math.max(r.w, r.h) * k));
@@ -903,19 +972,27 @@ function showMenu(sel) {
 }
 
 /* ================= chat ================= */
+/* Sandra shows ONE message at a time in the card above the input. A question with buttons owns the card until
+   it is answered; anything said meanwhile shows briefly as a hint. History is kept (hidden) for issue reports. */
+const plainText = (html) => String(html).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+function setCard(el) {
+  const pane = $('#guide-task');
+  if (el) pane.replaceChildren(el); else pane.replaceChildren();
+  $('#sandra-card').classList.toggle('hidden', !pane.childElementCount);
+}
+new MutationObserver(() => $('#sandra-card').classList.toggle('hidden', !$('#guide-task').childElementCount))
+  .observe($('#guide-task'), { childList: true });
 function bubble(html, who = 'ai', loc = null) {
   const el = document.createElement('div');
-  el.className = 'msg-in ' + (who === 'user' ? 'flex justify-end' : 'flex');
-  el.innerHTML = who === 'user' ? `<div class="max-w-[85%] bg-brand-100 text-brand-900 rounded-2xl rounded-br-md px-3 py-2 text-sm">${html}</div>`
-    : `<div class="w-full bg-white border border-slate-100 rounded-xl px-3 py-2 text-sm ${loc ? 'alert' : ''}">${loc ? '<div class="text-[11px] font-semibold text-brand-700 mb-0.5">📍 Click to see it</div>' : ''}${html}</div>`;
-  if (loc) {
-    const card = el.firstElementChild;
-    card.onclick = (ev) => { if (ev.target.closest('button')) return; card.classList.add('seen'); card.firstElementChild.textContent = '📍 Seen. Click to go back'; goTo(loc); };
-  }
-  const chat = $('#chat'), atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
-  chat.appendChild(el);
-  if (atBottom || who === 'user') chat.scrollTop = 1e9;   // like a live chat: follow new messages unless you scrolled up
-  if (document.body.classList.contains('guide-min') && who !== 'user') { unread++; $('#guide-new').textContent = unread; }
+  el.className = 'msg-in';
+  el.innerHTML = (loc ? '<button type="button" class="card-loc">📍 Show me where</button>' : '') + '<div>' + html + '</div>';
+  if (loc) el.querySelector('.card-loc').onclick = () => goTo(loc);
+  const log = document.createElement('div');
+  log.textContent = (who === 'user' ? 'You: ' : 'Sandra: ') + plainText(html);
+  $('#chat').appendChild(log);
+  if (who === 'user') return el;
+  if (!tourDecision) setCard(el);
+  else if (!/dots/.test(html)) hint(esc(plainText(html)).slice(0, 160), 5000);
   return el;
 }
 let unread = 0;
@@ -927,7 +1004,9 @@ $('#chat-form').addEventListener('submit', async (ev) => {
   const msg = $('#chat-input').value.trim(); if (!msg) return;
   $('#chat-input').value = '';
   bubble(esc(msg), 'user'); chatHistory.push({ role: 'user', content: msg });
+  if (window.sandraFlow?.onMessage && await window.sandraFlow.onMessage(msg)) return;
   if (draftReply) { draftReply(msg); return; }
+  if (brush.strokes.length && await submitPainted(msg)) return;
   if (selections.length) { for (const s of [...selections]) command(s, msg, msg); return; }
   if (CHANGE_RE.test(msg) && !OBJECTION.test(msg) && sdk) {
     try {
@@ -956,10 +1035,11 @@ function agentRooms() {
 }
 function setSandraState(phase, title, detail = '') {
   $('#guide-sub').textContent = phase;
-  const task = $('#guide-task');
-  if (!task) return;
-  task.innerHTML = '<div class="sandra-task"><strong>' + esc(title) + '</strong>' +
-    (detail ? '<p>' + esc(detail) + '</p>' : '') + '</div>';
+  if (tourDecision) return;          // never clobber a question the buyer hasn't answered
+  const el = document.createElement('div');
+  el.className = 'sandra-task msg-in';
+  el.innerHTML = '<strong>' + esc(title) + '</strong>' + (detail ? '<p>' + esc(detail) + '</p>' : '');
+  setCard(el);
 }
 function stopAgent() {
   if (agentBusy) {
@@ -1186,7 +1266,7 @@ async function guidedTour() {
 }
 
 /* ================= changes drawer, undo, compare ================= */
-function save() { try { localStorage.setItem(STORE, JSON.stringify(edits)); } catch {} }
+function save() { try { localStorage.setItem(STORE, JSON.stringify(edits, (k, v) => k === 'pending' ? undefined : v)); } catch {} }
 async function restoreEdits() {
   try { edits = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch { edits = []; }
   edits = edits.filter((e) => e.status === 'ready' && e.patches.length);   // unfinished work can't resume after a reload
@@ -1228,12 +1308,13 @@ async function swapOption(id, i) {
   }
 }
 const PILL = {
+  queued: ['On your list', 'text-brand-700 bg-brand-50'],
   understanding: ['Thinking…', 'text-brand-700 bg-brand-50 animate-pulse'], designing: ['Pricing…', 'text-brand-700 bg-brand-50 animate-pulse'],
   rendering: ['Rendering…', 'text-amber-700 bg-amber-50 animate-pulse'], fixing: ['Improving…', 'text-amber-700 bg-amber-50 animate-pulse'],
   checking: ['Checking…', 'text-sky-700 bg-sky-50 animate-pulse'], ready: ['Ready', 'text-emerald-700 bg-emerald-50'], failed: ['Failed', 'text-red-700 bg-red-50'],
 };
 function renderPlan() {
-  const on = edits.filter((e) => e.on !== false && e.status === 'ready');
+  const on = edits.filter((e) => e.on !== false && (e.status === 'ready' || e.status === 'queued'));
   $('.sandra-coverage').hidden = !on.some((e) => e.source);
   const total = on.reduce((s, e) => s + (e.cost || 0), 0), labor = on.reduce((s, e) => s + (e.option?.labor || 0), 0);
   $('#plan-count').textContent = edits.length;
@@ -1252,11 +1333,14 @@ function renderPlan() {
           ${e.status === 'ready' ? `<label class="flex items-center gap-1 text-slate-600"><input type="checkbox" data-on="${e.id}" ${e.on !== false ? 'checked' : ''} class="accent-brand-600">Show</label>
           <button data-go="${e.id}" class="text-brand-700 font-semibold">View</button>` : ''}
           <button data-del="${e.id}" class="text-slate-400 hover:text-red-600 ml-auto">Delete</button></div></div></div></li>`;
-  }).join('') || '<li class="text-sm text-slate-500 p-2">Nothing yet. Click <b>✎ Change something</b> and circle anything in the tour, or take the guided tour.</li>';
+  }).join('') || '<li class="text-sm text-slate-500 p-2">Nothing yet. Tell Sandra what you’d change, or tap ✎ and paint over anything in the tour.</li>';
   $('#plan').querySelectorAll('[data-del]').forEach((b) => b.onclick = () => removeEdit(b.dataset.del));
   $('#plan').querySelectorAll('[data-go]').forEach((b) => b.onclick = () => flyTo(edits.find((e) => e.id === b.dataset.go)));
   $('#plan').querySelectorAll('[data-on]').forEach((b) => b.onchange = () => { const e = edits.find((x) => x.id === b.dataset.on); e.on = b.checked; save(); refreshVisibility(); renderPlan(); });
   $('#plan').querySelectorAll('[data-swap]').forEach((s) => s.onchange = () => swapOption(s.dataset.swap, +s.value));
+  const queued = edits.filter((e) => e.status === 'queued').length;
+  $('#make-n').textContent = queued;
+  $('#make-btn').classList.toggle('hidden', !queued);
   $('#plan-total').textContent = money(total); $('#plan-labor').textContent = money(labor);
   $('#c-mods').textContent = money(total);
   $('#c-price').textContent = money(H.price) + (H.rent ? '/mo' : '');
@@ -1322,6 +1406,7 @@ let hintTimer;
 function hint(html, ms) { const h = $('#hint'); h.innerHTML = html; h.style.opacity = 1; clearTimeout(hintTimer); if (ms) hintTimer = setTimeout(() => h.style.opacity = 0, ms); }
 
 function welcome() {
+  if (window.sandraFlow) { scheduleCoverage(); return window.sandraFlow.start(); }
   setSandraState('Ready to explore', edits.length ? 'Welcome back' : 'Let’s take a look',
     edits.length ? edits.length + ' changes in your plan. I’ll check what’s already covered as we walk.' :
       'Start a guided tour, or ask me about a fixture in this view.');

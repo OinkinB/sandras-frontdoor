@@ -267,7 +267,10 @@ entry -> ramp, carpet -> hard floor, high counters/cabinets -> roll-under. Alway
 never invent a new fixture in empty floor space. Ignore reflections in mirrors, glass and windows: only real objects.
 Prioritize modest relevant changes: lever hardware for dexterity, lighting or contrast for low vision,
 visual alerts for hearing access, quiet-room or soft-close changes for sensory needs, and simple supports for balance.
-Never infer one kind of disability from another. Flag required width, stair and approach conflicts as fit concerns to
+Never infer one kind of disability from another. NEVER assume a wheelchair: wheelchair-specific changes (roll-under
+sinks, roll-in showers, wider doors, ramps, lowered counters) only if the buyer says they use a wheelchair. Older age
+alone means aging in place: grab bars, lever handles, better lighting, non-slip floors, a seat or handheld shower,
+fewer trip hazards, not wheelchair work. If needs are not described, suggest only small universal improvements. Flag required width, stair and approach conflicts as fit concerns to
 confirm. Do not offer to widen, move, or demolish a doorway by default. If the buyer requests structural work,
 label it structural, explain the impact briefly and let them choose. Never claim compliance or unverified dimensions.
 If a sink or vanity is described as wheelchair inaccessible, first address forward approach and knee/toe clearance.
