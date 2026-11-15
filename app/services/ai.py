@@ -5,6 +5,7 @@ Default Credentials; locally it falls back to the `gcloud auth login` session.
 """
 import base64
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -148,9 +149,13 @@ def _openai_edit(ctx_jpeg, mask_l, prompt, ref_png=None):
     return base64.b64decode(r.json()["data"][0]["b64_json"])
 
 
-def edit_image(ctx_jpeg: bytes, mask_l, prompt: str, ref_png: bytes | None = None) -> tuple[bytes, str]:
-    """Photoreal masked edit. Gemini first (with backoff on rate limits), OpenAI as fallback. Returns (image, provider)."""
+def edit_image(ctx_jpeg: bytes, mask_l, prompt: str, ref_png: bytes | None = None,
+               prefer: str | None = None) -> tuple[bytes, str]:
+    """Photoreal masked edit. Gemini first (with backoff on rate limits), OpenAI as fallback. Returns (image, provider).
+    prefer="openai" flips the order (OpenAI's masked edit is better at real shape changes)."""
     order = {"gemini": ["gemini"], "openai": ["openai"]}.get(IMAGE_PROVIDER, ["gemini", "openai"])
+    if prefer in order:
+        order = [prefer] + [o for o in order if o != prefer]
     errors = []
     with _image_lock:
         for prov in order:
@@ -325,25 +330,43 @@ Return JSON {{"angles":[{{"view":0,"box_2d":[0,0,0,0],"edit_box_2d":null,"edit_p
     return _as_obj(ask(prompt, [("image/jpeg", source)] + [("image/jpeg", image) for image, _ in views]), "angles")
 
 
-def verify_render(before: bytes, after: bytes, task: str, reference: bytes | None = None) -> dict:
-    """Quality gate: does the edited photo really show the requested change, finished and believable?"""
-    prompt = f"""You are a strict reviewer of photo edits for a home-remodel visualizer.
-Image 1 = the original photo region, image 2 = the edited region. The requested change was:
-"{task}"
-Image 1 is authoritative for camera angle, layout, and original fixture position. If supplied, image 3
+KEEP_RULES = """Image 1 is authoritative for camera angle, layout, and original fixture position. If supplied, image 3
 is a design reference from another angle. Compare the design only, never its position in the photograph.
 Fail if the fixture is duplicated, moved along a wall, moved to a different wall, rotated, resized,
 or moved vertically without the task asking for that. Compare the edges of the counter, position of
 the faucet, wall/floor junctions, vanishing points and foreground doorframes between before and after.
-For roll-under sinks, require a clear, finished opening for forward knee and toe approach under the actual basin,
-with protected plumbing set back. The basin and countertop stay fixed. A dark cubby, intact bottom shelf,
-obstructing pipe, or an opening off to the side does not solve this request.
-Fail if the requested change is missing or only partly done, the old item
+"""
+RESHAPE_RULES = """This request CHANGES GEOMETRY, so the edited part is supposed to look different in shape.
+Judge: is the requested shape change clearly done, finished (painted, trimmed, baseboard continued) and believable
+from this viewpoint, at the same camera angle and vanishing points? Things that were hidden behind the old shape
+(e.g. a sink and faucet behind a raised bar ledge) correctly become visible once it is lowered or removed; that is
+NOT a moved fixture. Small shifts of fixtures attached to the rebuilt part are fine. Fail only if the old shape is
+still there, the room around it was redesigned (new islands, walls, appliances), or it looks fake or unfinished.
+Calibrate: when the shape change is clearly done and the room is intact, score 7-9 even with minor texture, trim or
+sharpness nitpicks (list them in issues). Below 7 only for a real failure a homeowner would notice at a glance.
+"""
+RESHAPE_WORDS = re.compile(r"\b(lower|lowered|raise|raised to|remove|removing|widen|widened|shorten|lengthen|extend|level|"
+                           r"flatten|take out|demolish|open up|enlarge|narrow|ramp|roll-under|roll under|curbless|walk-in)\b", re.I)
+
+
+def verify_render(before: bytes, after: bytes, task: str, reference: bytes | None = None) -> dict:
+    """Quality gate: does the edited photo really show the requested change, finished and believable?"""
+    rules = RESHAPE_RULES if RESHAPE_WORDS.search(task) else KEEP_RULES
+    special = ""
+    if re.search(r"roll.?under|knee", task, re.I):
+        special += ("For roll-under sinks, require a clear, finished opening for forward knee and toe approach under the actual basin,\n"
+                    "with protected plumbing set back. The basin and countertop stay fixed. A dark cubby, intact bottom shelf,\n"
+                    "obstructing pipe, or an opening off to the side does not solve this request.\n")
+    if re.search(r"cabinet", task, re.I) and re.search(r"remov", task, re.I):
+        special += "If all base cabinets were to be removed, fail a partial opening or remaining furniture frame.\n"
+    prompt = f"""You are a strict reviewer of photo edits for a home-remodel visualizer.
+Image 1 = the original photo region, image 2 = the edited region. The requested change was:
+"{task}"
+{rules}{special}Fail if the requested change is missing or only partly done, the old item
 is still clearly there when it should be gone, it looks like a construction site, there are smears, warped geometry,
 floating objects, duplicated fixtures, cut-off items at the edges, or obvious seams.
 Fail new smeared or blurred floor bands, broken plank or tile lines, or steps introduced by the edit.
 Ignore scan artifacts already in the original that are outside the edited region.
-If all base cabinets were to be removed, fail a partial opening or remaining furniture frame.
 Return JSON {{"ok": true|false, "score": 0-10, "issues": [str], "fix": str (one concrete instruction to fix it, or "")}}.
 ok must be true only if score >= 7."""
     imgs = [("image/jpeg", before), ("image/jpeg", after)]

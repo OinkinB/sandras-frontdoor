@@ -197,6 +197,54 @@ def render(home_id):
     return jsonify(meta)
 
 
+def _empty_file(home_id, sweep):
+    if not re.fullmatch(r"[0-9a-z]{6,40}", sweep or ""):
+        abort(404)
+    d = current_app.config["CACHE_DIR"] / "empty" / str(home_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{sweep}.jpg"
+
+
+@bp.get("/home/<int:home_id>/empty/<sweep>")
+def empty_get(home_id, sweep):
+    """The de-furnished 360 panorama of one scan point, if Sandra already made it."""
+    _home(home_id)
+    f = _empty_file(home_id, sweep)
+    if request.args.get("src"):
+        f = f.with_name(f"{sweep}_src.jpg")
+    if not f.exists():
+        return jsonify({"ready": False}), 404
+    meta = f.parent / f"{sweep}.json"
+    yaw = json.loads(meta.read_text()).get("yaw", 0) if meta.exists() else 0
+    if request.args.get("meta"):
+        return jsonify({"ready": True, "yaw": yaw})
+    return Response(f.read_bytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "max-age=604800", "X-Capture-Yaw": str(yaw)})
+
+
+@bp.post("/home/<int:home_id>/empty/<sweep>")
+def empty_make(home_id, sweep):
+    """Body: image (equirectangular data URL of this scan point). Removes furniture and belongings, keeps the
+    architecture pixel-aligned, caches the panorama per scan point."""
+    _home(home_id)
+    f = _empty_file(home_id, sweep)
+    if f.exists():
+        return jsonify({"ready": True, "cached": True})
+    try:
+        body = request.get_json(force=True)
+        src = _b64img(body["image"])
+        # the panorama is centered on the camera heading at capture time; the tour needs it to line the sphere up
+        (f.parent / f"{sweep}.json").write_text(json.dumps({"yaw": float(body.get("yaw") or 0)}))
+        f.with_name(f"{sweep}_src.jpg").write_bytes(src)
+        jpeg, provider, change = imaging.empty_pano(src)
+    except Exception as e:
+        current_app.logger.error("Empty-room error on %s: %s", request.path, e)
+        return jsonify({"error": f"Could not empty this room: {e}"[:300]}), 502
+    f.write_bytes(jpeg)
+    current_app.logger.info("Emptied %s/%s via %s (change %.1f)", home_id, sweep, provider, change)
+    return jsonify({"ready": True, "provider": provider, "change": round(change, 1)})
+
+
 @bp.get("/home/<int:home_id>/render/<rid>/<kind>")
 def render_file(home_id, rid, kind):
     if not re.fullmatch(r"[0-9a-f]{12}", rid) or kind not in ("patch", "after", "before", "ref"):

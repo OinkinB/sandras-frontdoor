@@ -23,7 +23,8 @@ function SandraRover() {
     this.head = new T.Group();
     this.wheels = [];
     this.geometry = [];
-    const M = (c) => new T.MeshBasicMaterial({ color: c });
+    // transparent queue + high renderOrder so she draws over the emptied-room sphere (still depth-tested by walls)
+    const M = (c) => new T.MeshBasicMaterial({ color: c, transparent: true, opacity: 1 });
     this.materials = [M(PINK.body), M(PINK.top), M(PINK.dark), M(PINK.eye), M(PINK.accent), M(PINK.cheek), M(PINK.hub)];
     const mesh = (geometry, material, parent, x, y, z) => {
       this.geometry.push(geometry);
@@ -57,6 +58,7 @@ function SandraRover() {
     }
     root.add(this.body);
     root.scale.setScalar(0.9);
+    root.traverse((o) => { o.renderOrder = 4000; });
     this.destination = new T.Vector3(); this.origin = new T.Vector3(); this.control = new T.Vector3();
     this.outputs.objectRoot = root;
     root.visible = false;
@@ -163,36 +165,63 @@ function roverToSweep(id, phase = 'walk') {
   roverAt(p, phase, { snap: !last || Math.abs(last.y - p.y) > 0.55 || dist(last, p) > 3.25 });
 }
 
-/* ---------- obstacle-aware placement ---------- */
-// A world point is open floor if the scan at that screen spot is floor-height and nothing sits in front of it.
-async function openFloorAlong(a, b, floorY, steps = 4) {
+/* ---------- obstacle-aware placement ----------
+ * Sandra is ~0.4 m wide. A spot is usable only if the floor in a ring around it is open (no wall, cabinet base,
+ * couch or table leg within her radius), and her actual curved route, plus her half-width on each side, is open too. */
+const ROVER_R = 0.3;
+// true = open floor here, false = blocked, null = can't see it (off screen)
+async function openPoint(p, floorY) {
   const W = iframe.clientWidth, Hh = iframe.clientHeight;
-  for (let i = 1; i <= steps; i++) {
-    const t = i / (steps + 1), p = { x: a.x + (b.x - a.x) * t, y: floorY + 0.02, z: a.z + (b.z - a.z) * t };
-    const q = sdk.Conversion.worldToScreen(p, poseCache, { w: W, h: Hh });
-    const offscreen = !q || q.z > 1 || q.z < -1 || q.x < 0 || q.y < 0 || q.x > W || q.y > Hh;
-    if (offscreen) {
-      // the stretch right under the visitor is below the bottom of the view; that's where they stand, so it's open
-      if (Math.hypot(p.x - poseCache.position.x, p.z - poseCache.position.z) < 1.3) continue;
-      return false;
+  const q = sdk.Conversion.worldToScreen({ x: p.x, y: floorY + 0.02, z: p.z }, poseCache, { w: W, h: Hh });
+  if (!q || q.z > 1 || q.z < -1 || q.x < 2 || q.y < 2 || q.x > W - 2 || q.y > Hh - 2) return null;
+  const h = await hitAt(q.x, q.y);
+  if (!h || Math.abs(h.y - floorY) > 0.06) return false;                                         // furniture, cabinet, wall
+  const expected = Math.hypot(p.x - poseCache.position.x, p.y - poseCache.position.y, p.z - poseCache.position.z);
+  if (dist(poseCache.position, h) < expected - 0.18) return false;                               // something in front of it
+  return true;
+}
+const nearVisitor = (p) => Math.hypot(p.x - poseCache.position.x, p.z - poseCache.position.z) < 1.3;
+async function hasRoom(p, floorY, r = ROVER_R) {
+  const checks = [openPoint(p, floorY)];
+  for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; checks.push(openPoint({ x: p.x + Math.cos(a) * r, y: floorY, z: p.z + Math.sin(a) * r }, floorY)); }
+  const res = await Promise.all(checks);
+  if (res[0] !== true) return false;
+  return res.slice(1).every((v, k) => v === true || (v === null && nearVisitor({ x: p.x + Math.cos(k * Math.PI / 4) * r, z: p.z + Math.sin(k * Math.PI / 4) * r })));
+}
+function curvePoint(a, b, curve, t) {   // same curve the rover component drives
+  const d = Math.hypot(b.x - a.x, b.z - a.z), mx = (a.x + b.x) / 2, mz = (a.z + b.z) / 2;
+  const sx = (b.z - a.z) / (d || 1), sz = -(b.x - a.x) / (d || 1), off = curve * Math.min(0.6, d * 0.35);
+  const cx = mx + sx * off, cz = mz + sz * off;
+  return { x: (1 - t) ** 2 * a.x + 2 * (1 - t) * t * cx + t * t * b.x, z: (1 - t) ** 2 * a.z + 2 * (1 - t) * t * cz + t * t * b.z, sx, sz };
+}
+async function routeOpen(a, b, floorY, curve) {
+  for (const t of [0.2, 0.35, 0.5, 0.65, 0.8]) {
+    const c = curvePoint(a, b, curve, t);
+    for (const side of [0, -0.22, 0.22]) {
+      const p = { x: c.x + c.sx * side, y: floorY, z: c.z + c.sz * side };
+      const ok = await openPoint(p, floorY);
+      if (ok === false || (ok === null && !nearVisitor(p))) return false;
     }
-    const h = await hitAt(q.x, q.y);
-    if (!h || Math.abs(h.y - floorY) > 0.07) return false;                                       // furniture or a step
-    if (dist(poseCache.position, h) < dist(poseCache.position, p) - 0.2) return false;         // something in between
   }
   return true;
 }
+// back-compat for callers
+const openFloorAlong = (a, b, floorY) => routeOpen(a, b, floorY, 0);
 async function pickOpenSpot(floorY, near, { prefer = null, minCam = 0.95, maxCam = 3.2 } = {}) {
   const W = iframe.clientWidth, Hh = iframe.clientHeight, cam = poseCache.position;
   const coords = [];
-  for (const v of [0.62, 0.72, 0.82, 0.9]) for (const u of [0.12, 0.25, 0.38, 0.5, 0.62, 0.75, 0.88]) coords.push([u, v]);
+  for (const v of [0.62, 0.72, 0.82, 0.9]) for (const u of [0.18, 0.3, 0.42, 0.5, 0.58, 0.7, 0.82]) coords.push([u, v]);
   const hits = await Promise.all(coords.map(([u, v]) => hitAt(u * W, v * Hh)));
   const spots = hits.map((p, i) => ({ p, uv: coords[i] })).filter(({ p }) => p && Math.abs(p.y - floorY) < 0.05 &&
     Math.hypot(p.x - cam.x, p.z - cam.z) > minCam && Math.hypot(p.x - cam.x, p.z - cam.z) < maxCam && (!near || dist(p, near) > 0.55));
-  // prefer the edges of the view (she likes to roll around the sides), or a requested screen x
   spots.sort((a, b) => (prefer != null ? Math.abs(a.uv[0] - prefer) - Math.abs(b.uv[0] - prefer)
     : Math.abs(b.uv[0] - 0.5) - Math.abs(a.uv[0] - 0.5)) + (Math.random() - 0.5) * 0.4);
-  for (const s of spots.slice(0, 6)) if (!near || await openFloorAlong(near, s.p, floorY)) return s.p;
+  for (const s of spots.slice(0, 8)) {
+    if (!(await hasRoom(s.p, floorY))) continue;
+    if (!near) return { p: s.p, curve: 0 };
+    const swing = (Math.random() < 0.5 ? -1 : 1) * (0.5 + Math.random() * 0.5);
+    for (const curve of [swing, swing / 2, 0]) if (await routeOpen(near, s.p, floorY, curve)) return { p: s.p, curve };
+  }
   return null;
 }
 
@@ -215,7 +244,8 @@ async function setRoverState(phase, room = null, sweep = null, rect = null) {
   const prefer = rect ? Math.max(0.15, Math.min(0.85, (rect.x + rect.w / 2) / W)) : null;
   const spot = await pickOpenSpot(puck.y, current, { prefer });
   if (ticket !== roverMotion || !sameFrame(pose, snapPose())) return;
-  roverAt(spot || puck, phase === 'hop' ? 'scan' : phase, { snap: !spot && dist(current, puck) > 3, spin: phase === 'inspect' });
+  if (spot) roverAt(spot.p, phase === 'hop' ? 'scan' : phase, { curve: spot.curve, spin: phase === 'inspect' });
+  else if (dist(current, puck) > 3) roverAt(puck, phase, { snap: true });   // only jump if she's far away; otherwise stay put
 }
 
 /* ---------- free wandering while you look around ---------- */
@@ -231,7 +261,7 @@ setInterval(async () => {
   const pose = snapPose(), ticket = ++roverMotion;
   const spot = await pickOpenSpot(puck.y, here);
   if (ticket !== roverMotion || !sameFrame(pose, snapPose()) || !spot) return;
-  roverAt(spot, 'idle', { spin: Math.random() < 0.22 });
+  roverAt(spot.p, 'idle', { curve: spot.curve, spin: Math.random() < 0.22 });
 }, 3200);
 
 /* ---------- speech bubble above Sandra ---------- */

@@ -149,6 +149,15 @@ Generated image quality still needs a provider-backed check.
 
 ---
 
+### Empty rooms (automatic)
+Furnished listings are hard to picture as your own. The moment you arrive at a scan point, Sandra captures its
+360° panorama (`Renderer.takeEquirectangular`), the image model removes furniture and belongings while keeping
+walls, windows, doors, floors and built-ins pixel-aligned (so real dimensions are untouched), a quick vision check
+retries once if anything big is left, and the result is wrapped on a sphere centered on that scan point
+(`app/static/js/empty-room.js`, `imaging.empty_pano`, `GET/POST /api/home/<id>/empty/<sweep>`). Panoramas are cached
+per scan point. The panorama is centered on the camera heading at capture, so the sphere turns by that heading - 90°.
+"Show furnished" brings everything back for comparison.
+
 ## How it works
 
 ```
