@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% block title %}{{ home.address }} · Sandra's FrontDoor{% endblock %}
-{% block bodyclass %}h-screen overflow-hidden flex flex-col{% endblock %}
+{% block bodyclass %}sandra-tour h-screen overflow-hidden flex flex-col{% endblock %}
 {% block body %}
 <!-- Listing + cost bar -->
-<div class="bg-white border-b border-slate-200/80 shrink-0">
+<div class="listing-bar shrink-0">
   <div class="px-4 h-[64px] flex items-center gap-4">
     <a href="javascript:history.back()" class="flex items-center gap-1.5 text-sm font-semibold text-slate-600 hover:text-ink shrink-0" aria-label="Back to results">
       <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M15 6l-6 6 6 6"/></svg><span class="hidden xl:inline">Back to results</span></a>
@@ -20,14 +20,14 @@
       <button data-drawer="changes" class="hidden lg:block text-right hover:bg-slate-50 rounded-lg px-1"><div class="text-[11px] text-slate-500">Planned changes (<span id="plan-count">0</span>)</div><div class="font-bold text-brand-700" id="c-mods">$0</div></button>
       <div class="hidden lg:block text-slate-300 text-xl">=</div>
       <div class="bg-brand-50 rounded-xl px-3 py-1"><div class="text-[11px] text-brand-700">Total cost <span id="budget"></span></div><div class="font-extrabold text-brand-700" id="c-true"></div></div>
-      <button id="agent-run" class="bg-brand-600 hover:bg-brand-700 text-white rounded-xl px-4 py-2 text-sm font-semibold">✦ Guided tour</button>
+      <button id="agent-run" class="sandra-primary">Tour with Sandra</button>
     </div>
   </div>
 </div>
 
 <!-- The tour fills everything; tools and the guide float over it -->
 <main class="relative flex-1 min-h-0 bg-slate-900" id="stage">
-  <iframe id="showcase" class="absolute inset-0 w-full h-full" allow="xr-spatial-tracking; fullscreen"></iframe>
+  <iframe id="showcase" class="absolute inset-0 w-full h-full" title="Interactive Matterport home tour" allow="xr-spatial-tracking; fullscreen"></iframe>
   <div id="overlay" class="absolute inset-0 z-10" style="pointer-events:none"></div>
   <div id="photos" class="absolute inset-0 hidden z-20 bg-slate-900/95 overflow-y-auto scroll-thin p-3 pt-16 pr-[410px] grid grid-cols-2 md:grid-cols-3 gap-2 content-start">
     {% for p in photos %}<img src="{{ p }}" alt="" loading="lazy" class="w-full aspect-[4/3] object-cover rounded-lg">{% endfor %}
@@ -39,6 +39,7 @@
       <button data-view="tour" class="view-tab px-4 py-1.5 rounded-full bg-brand-600 text-white">3D tour</button>
       <button data-view="photos" class="view-tab px-4 py-1.5 rounded-full">Photos</button>
       <button data-drawer="outside" class="px-4 py-1.5 rounded-full hover:bg-slate-100">Outside</button>
+      <button data-drawer="access" class="px-4 py-1.5 rounded-full hover:bg-slate-100">Access</button>
     </div>
     <div id="room-nav" class="hidden pointer-events-auto relative">
       <div class="flex items-center bg-white/95 shadow rounded-full text-sm font-semibold">
@@ -52,9 +53,6 @@
       <span id="compare-dot" class="w-9 h-6 rounded-full bg-brand-600 relative transition"><span class="absolute top-0.5 right-0.5 w-5 h-5 rounded-full bg-white shadow transition"></span></span>
       <span id="compare-label">Your changes on</span></button>
   </div>
-
-  <!-- processing cards -->
-  <div id="jobs" class="absolute top-16 left-3 z-30 w-80 space-y-2 pointer-events-auto"></div>
 
   <!-- drawers (left side, over the tour) -->
   <aside data-drawer-panel="changes" class="drawer">
@@ -81,7 +79,7 @@
   </aside>
 
   <!-- bottom-center controls -->
-  <div class="absolute bottom-4 z-30 flex flex-col items-center gap-2" style="left: calc((100% - var(--chat-w)) / 2); transform: translateX(-50%)">
+  <div class="tour-controls absolute bottom-4 z-30 flex flex-col items-center gap-2" style="left: calc((100% - var(--chat-w)) / 2); transform: translateX(-50%)">
     <div id="hint" class="bg-black/70 text-white text-sm px-4 py-2 rounded-full backdrop-blur pointer-events-none transition-opacity text-center max-w-[60vw]">Loading 3D tour…</div>
     <div id="tool-pick" class="hidden flex bg-white/95 shadow rounded-full p-1 text-xs font-semibold">
       <button data-tool-pick="lasso" class="px-3 py-1.5 rounded-full bg-ink text-white">✎ Draw</button>
@@ -94,31 +92,47 @@
   </div>
 
   <!-- the guide: floats over the tour -->
-  <aside id="guide" class="absolute top-3 right-3 bottom-3 z-40 w-[var(--chat-w)] flex flex-col rounded-2xl bg-white/95 backdrop-blur shadow-2xl ring-1 ring-black/5 overflow-hidden transition-all">
-    <div class="px-4 py-2.5 border-b border-slate-100 flex items-center gap-2.5 shrink-0">
-      <span class="w-8 h-8 rounded-xl bg-brand-50 text-brand-600 grid place-items-center">✦</span>
-      <div class="flex-1 min-w-0"><div class="font-bold leading-tight text-sm">Your home guide</div><div class="text-[11px] text-slate-500 truncate" id="guide-sub">Click a highlighted message to go see it</div></div>
-      <button id="chat-clear" class="text-xs text-slate-500 rounded-lg px-2 py-1 hover:bg-slate-100">Clear</button>
-      <button id="guide-min" class="w-7 h-7 rounded-lg hover:bg-slate-100 text-slate-500" aria-label="Minimize guide">—</button>
+  <aside id="guide" class="sandra-dock">
+    <div class="sandra-dock-head">
+      <span class="sandra-mark" aria-hidden="true"></span>
+      <div class="flex-1 min-w-0"><h2>Sandra</h2><p id="guide-sub" role="status">Connecting to the tour</p></div>
+      <button id="guide-min" class="sandra-secondary" aria-label="Minimize Sandra">−</button>
     </div>
-    <div id="chat" class="flex-1 min-h-0 overflow-y-auto scroll-thin px-3 py-3 space-y-2"></div>
-    <div class="p-2.5 border-t border-slate-100 shrink-0">
+    <div class="sandra-dock-controls">
+      <button type="button" id="guide-title-run" class="sandra-primary">Start guided tour</button>
+      <button type="button" id="guide-stop" class="sandra-secondary">End tour</button>
+      <button type="button" id="guide-index" class="sandra-secondary">Objects in view</button>
+      <button type="button" data-drawer="changes" class="sandra-secondary">View plan</button>
+      <button type="button" id="guide-hop" class="sandra-secondary" title="Ask Sandra to check for a safe surface to hop onto">Scout with Sandra</button>
+    </div>
+    <div id="guide-task" class="sandra-dock-task" aria-live="polite"></div>
+    <div class="sandra-coverage">
+      <p id="coverage-status" role="status"></p><button id="guide-angle-retry" type="button" class="sandra-secondary">Check this angle</button>
+    </div>
+    <div id="jobs" class="sandra-job-stack scroll-thin"></div>
+    <div class="sandra-history-head">
+      <button id="history-toggle" type="button" aria-controls="chat" aria-expanded="true">Tour conversation</button>
+      <button id="chat-clear" type="button" class="text-xs">Clear</button>
+    </div>
+    <div id="chat" class="sandra-history scroll-thin" aria-label="Tour conversation"></div>
+    <div class="sandra-composer">
       <div id="sel-chips" class="flex flex-wrap gap-2 mb-2"></div>
-      <form id="chat-form" class="flex items-center gap-2 bg-white border border-slate-200 rounded-2xl px-3 py-1 focus-within:border-brand-400">
-        <input id="chat-input" class="flex-1 outline-none py-1.5 text-sm bg-transparent" placeholder="Ask, or “make this a walk-in shower”" autocomplete="off">
-        <button class="w-8 h-8 rounded-xl bg-brand-600 text-white grid place-items-center hover:bg-brand-700" aria-label="Send">
-          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 12l16-8-6 16-2-6z"/></svg></button>
+      <form id="chat-form" class="flex items-center gap-2 px-3 py-1">
+        <input id="chat-input" class="flex-1 min-w-0 outline-none py-1.5 text-sm bg-transparent" aria-label="Ask Sandra" placeholder="Ask Sandra or refine the change" autocomplete="off">
+        <button class="sandra-send" aria-label="Send to Sandra">↗</button>
       </form>
     </div>
   </aside>
-  <button id="guide-open" class="hidden absolute bottom-4 right-4 z-40 bg-brand-600 text-white rounded-full shadow-xl px-4 py-2.5 text-sm font-semibold">✦ Guide <span id="guide-new" class="ml-1 bg-white text-brand-700 rounded-full px-1.5 text-xs"></span></button>
+  <button id="guide-open" class="hidden absolute bottom-4 right-4 z-40 sandra-primary">Open Sandra <span id="guide-new" class="ml-1 text-xs"></span></button>
 </main>
-<style>:root{--chat-w:380px} body.guide-min{--chat-w:0px}</style>
+
 {% endblock %}
 {% block scripts %}
 <script>
   window.HOME = {{ home | tojson }};
   window.SDK_KEY = {{ sdk_key | tojson }};
 </script>
-<script src="{{ url_for('static', filename='js/tour.js') }}"></script>
+<script defer src="{{ url_for('static', filename='js/tour.js') }}"></script>
+<script defer src="{{ url_for('static', filename='js/inventory.js') }}"></script>
+<script defer src="{{ url_for('static', filename='js/sandra-rover.js') }}"></script>
 {% endblock %}

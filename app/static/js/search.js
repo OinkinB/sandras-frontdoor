@@ -1,91 +1,120 @@
-const $ = (s) => document.querySelector(s);
+const $ = (selector) => document.querySelector(selector);
 const money = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
-const NEED_ICONS = {
-  no_stairs: '⌂', step_free_entry: '↦', wide_doorways: '⇔', walk_in_shower: '◌',
-  grab_bars: '═', first_floor_bedroom: '▭', smooth_flooring: '▤', garage: '▣'
-};
+const safe = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const rent = new URLSearchParams(location.search).get('rent') === '1';
 let state = { filters: null, results: [], labels: {} };
+let markRequired = false;
+let requestVersion = 0;
 
-function chip(key, label, on) {
+function chip(key, label, selected, required) {
   const b = document.createElement('button');
-  b.type = 'button'; b.className = 'chip-btn'; b.dataset.need = key;
-  b.setAttribute('aria-pressed', on ? 'true' : 'false');
-  b.innerHTML = `<span aria-hidden="true">${NEED_ICONS[key] || '•'}</span>${label}`;
+  b.type = 'button';
+  b.className = 'chip-btn';
+  b.dataset.need = key;
+  b.dataset.required = String(required);
+  b.setAttribute('aria-pressed', String(selected));
+  b.textContent = label + (required ? ' · Must have' : '');
   b.onclick = () => {
-    const f = state.filters; if (!f) return;
-    const set = new Set(f.needs);
-    set.has(key) ? set.delete(key) : set.add(key);
-    f.needs = [...set];
-    run(null, f);
+    const f = state.filters;
+    const needs = new Set(f.needs), hard = new Set(f.required);
+    if (markRequired) {
+      if (hard.has(key)) hard.delete(key);
+      else { hard.add(key); needs.add(key); }
+    } else if (needs.has(key)) { needs.delete(key); hard.delete(key); }
+    else needs.add(key);
+    run('', { ...f, needs: [...needs], required: [...hard] });
   };
   return b;
 }
-
 function renderChips() {
-  const box = $('#chips'); box.innerHTML = '';
+  const box = $('#chips');
   const f = state.filters;
-  Object.entries(state.labels).forEach(([k, l]) => box.appendChild(chip(k, l, f.needs.includes(k))));
-  if (f.max_price) box.insertAdjacentHTML('beforeend', `<span class="chip-btn" aria-pressed="true">Under ${money(f.max_price)}</span>`);
-  if (f.city) box.insertAdjacentHTML('beforeend', `<span class="chip-btn" aria-pressed="true">${f.city}</span>`);
+  box.replaceChildren(...Object.entries(state.labels).map(([k, label]) => chip(k, label, f.needs.includes(k), f.required.includes(k))));
 }
-
 function card(h) {
-  const tone = h.match >= 85 ? 'bg-emerald-50 text-emerald-700' : h.match >= 65 ? 'bg-sky-50 text-sky-700' : 'bg-amber-50 text-amber-700';
-  const word = h.match >= 85 ? 'High accessibility match' : h.match >= 65 ? 'Accessibility match' : 'Needs changes';
-  const mods = h.mods.length
-    ? `<div class="mt-2 text-[13px] text-slate-600">+ ${money(h.mod_total)} est. changes · <span class="font-semibold text-ink">True cost ${money(h.true_cost)}</span></div>
-       <div class="mt-1 text-[12px] text-slate-500 truncate">${h.mods.map(m => m.label).join(' · ')}</div>`
-    : `<div class="mt-2 text-[13px] text-emerald-700 font-medium">Ready as listed: no changes needed for your needs</div>`;
-  const yes = state.filters.needs.filter(n => h.evidence[n]?.status === 'yes').map(n => state.labels[n]);
-  const per = h.rent ? '/mo' : '';
-  return `<a href="/home/${h.id}?needs=${state.filters.needs.join(',')}" class="group block bg-white rounded-2xl shadow-card overflow-hidden hover:-translate-y-0.5 hover:shadow-lg transition">
-    <div class="relative aspect-[4/3] bg-slate-100 overflow-hidden">
-      ${h.photo ? `<img src="${h.photo}" alt="" loading="lazy" class="w-full h-full object-cover group-hover:scale-[1.03] transition duration-500">` : ''}
-      <span class="absolute left-3 bottom-3 inline-flex items-center gap-1.5 bg-ink/80 text-white text-xs font-semibold px-2.5 py-1.5 rounded-lg backdrop-blur">
-        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg>3D Tour</span>
-      ${h.stories === 1 ? '<span class="absolute right-3 top-3 bg-white/95 text-xs font-semibold px-2 py-1 rounded-lg">Single-level</span>' : ''}
-    </div>
-    <div class="p-4">
-      <div class="text-2xl font-bold tracking-tight">${money(h.price)}<span class="text-base font-medium text-slate-500">${per}</span></div>
-      <div class="mt-0.5 text-sm text-slate-600">${h.beds ?? '–'} bd · ${h.baths ?? '–'} ba · ${h.sqft ? h.sqft.toLocaleString() + ' sq ft' : '—'}</div>
-      <div class="text-sm text-slate-500 truncate">${h.address}, ${h.city}, ${h.state}${h.neighborhood ? ' · ' + h.neighborhood : ''}</div>
-      ${mods}
-      ${yes.length ? `<div class="mt-2 flex flex-wrap gap-1">${yes.slice(0, 3).map(y => `<span class="text-[11px] bg-slate-100 text-slate-700 px-2 py-0.5 rounded-md">✓ ${y}</span>`).join('')}</div>` : ''}
-      <div class="mt-3 flex items-center justify-between rounded-xl px-3 py-2 ${tone}">
-        <span class="text-[13px] font-semibold flex items-center gap-1.5">♿ ${word}</span><span class="font-bold">${h.match}%</span>
-      </div>
-    </div></a>`;
+  const unconfirmed = h.required_unconfirmed || [];
+  const pending = unconfirmed.length > 0;
+  const hard = (state.filters.required || []).length;
+  const supported = state.filters.needs.filter((n) => h.evidence[n]?.status === 'yes' && !state.filters.required.includes(n));
+  const evidence = pending ? unconfirmed.map((n) => state.labels[n]).join(', ') + ' · confirm in the scan' :
+    hard ? 'Must-haves supported by listing' : '';
+  const priced = h.mods.length ? 'Estimated changes ' + money(h.mod_total) : '';
+  const photos = /^https?:\/\//i.test(h.photo || '') ? '<img src="' + safe(h.photo) + '" alt="" loading="lazy" class="w-full h-full object-cover">' : '';
+  const params = new URLSearchParams({ needs: state.filters.needs.join(','), required: state.filters.required.join(',') });
+  return '<a href="/home/' + h.id + '?' + params.toString() + '" class="home-card group block bg-white rounded-xl overflow-hidden">' +
+    '<div class="relative aspect-[4/3] bg-slate-100 overflow-hidden">' + photos +
+    '<span class="absolute left-3 bottom-3 inline-flex items-center gap-1 bg-ink/80 text-white text-xs font-semibold px-2.5 py-1.5 rounded-md">3D tour with Sandra</span></div>' +
+    '<div class="p-4"><div class="text-2xl font-bold tracking-tight">' + money(h.price) + (h.rent ? '<span class="text-sm text-slate-500"> / mo</span>' : '') +
+    '</div><div class="text-base font-semibold">' + safe(h.address) + '</div><div class="text-sm text-slate-500">' +
+    safe(h.city + ', ' + h.state) + ' · ' + (h.beds ?? '–') + ' bd · ' + (h.baths ?? '–') + ' ba</div>' +
+    (evidence ? '<p class="match-evidence' + (pending ? ' pending' : '') + '">' + safe(evidence) + '</p>' : '') +
+    (supported.length ? '<p class="text-xs text-slate-500 mt-2">' + safe(supported.slice(0, 3).map((n) => state.labels[n]).join(' · ')) + '</p>' : '') +
+    '<div class="card-meter"><span>' + (priced || (state.filters.needs.length ? 'Listing evidence' : 'Open tour')) +
+    '</span><strong>' + (state.filters.needs.length ? h.match + '% fit' : '↗') + '</strong></div></div></a>';
 }
 
 function renderGrid() {
   const sort = $('#sort').value;
-  const r = [...state.results];
-  if (sort === 'true') r.sort((a, b) => a.true_cost - b.true_cost);
-  if (sort === 'mods') r.sort((a, b) => a.mod_total - b.mod_total || b.match - a.match);
-  $('#grid').innerHTML = r.map(card).join('') || '<p class="text-slate-500">No homes match. Try removing a filter.</p>';
-  const hero = r.find(x => x.photo);
-  if (hero) { const img = $('#hero-img'); img.onload = () => img.classList.remove('opacity-0'); img.src = hero.photo; }
-}
-
-function skeleton() {
-  $('#grid').innerHTML = Array.from({ length: 8 }, () =>
-    `<div class="bg-white rounded-2xl shadow-card overflow-hidden animate-pulse"><div class="aspect-[4/3] bg-slate-200"></div><div class="p-4 space-y-2"><div class="h-6 bg-slate-200 rounded w-1/2"></div><div class="h-4 bg-slate-100 rounded"></div><div class="h-9 bg-slate-100 rounded-xl"></div></div></div>`).join('');
+  const results = [...state.results];
+  const unresolved = (h) => (h.required_unconfirmed || []).length;
+  if (sort === 'true') results.sort((a, b) => unresolved(a) - unresolved(b) || a.true_cost - b.true_cost);
+  if (sort === 'mods') results.sort((a, b) => unresolved(a) - unresolved(b) || a.mod_total - b.mod_total || b.match - a.match);
+  $('#grid').innerHTML = results.map(card).join('') ||
+    '<p class="text-slate-500">No listings fit these filters. Try a wider search area, a different budget, or a different must-have.</p>';
+  const hero = results.find((x) => /^https?:\/\//i.test(x.photo || ''));
+  if (hero) {
+    const img = $('#hero-img');
+    if (img.getAttribute('src') !== hero.photo) {
+      const candidate = new Image();
+      candidate.onload = () => { if (state.results.includes(hero)) img.src = hero.photo; };
+      candidate.src = hero.photo;
+    }
+  }
 }
 
 async function run(q, filters) {
-  skeleton();
-  $('#persona').innerHTML = q ? 'AI agent is reading your request<span class="dots"><span>.</span><span>.</span><span>.</span></span>' : '';
-  const res = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(filters ? { filters } : { q }) });
-  const d = await res.json();
-  state = { filters: d.filters, results: d.results, labels: d.need_labels };
-  try { if (d.filters.persona) sessionStorage.setItem('fd-persona', d.filters.persona); sessionStorage.setItem('fd-budget', d.filters.max_price || ''); } catch {}
-  $('#persona').textContent = d.filters.persona ? `Searching for: ${d.filters.summary || ''}` : '';
-  $('#result-sub').textContent = `${d.count.toLocaleString()} homes with 3D tours · ranked by match, then true cost (price + changes)`;
-  renderChips(); renderGrid();
+  const version = ++requestVersion;
+  $('#persona').textContent = q ? 'Sandra is checking your must-haves…' : '';
+  $('#grid').setAttribute('aria-busy', 'true');
+  try {
+    const body = filters ? { filters } : { q, rent };
+    const response = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error('Search failed');
+    const data = await response.json();
+    if (version !== requestVersion) return;
+    state = { filters: data.filters, results: data.results, labels: data.need_labels };
+    try {
+      sessionStorage.setItem('fd-persona', data.filters.persona || '');
+      sessionStorage.setItem('fd-budget', data.filters.max_price || '');
+      if (q) sessionStorage.setItem('fd-search-query', q);
+    } catch {}
+    $('#persona').textContent = q ? data.filters.summary || '' : '';
+    const labels = data.filters.required.map((n) => data.need_labels[n]);
+    $('#result-sub').textContent = data.count.toLocaleString() + ' homes with 3D tours' +
+      (labels.length ? ' · Must-haves: ' + labels.join(', ') : '');
+    renderChips();
+    renderGrid();
+  } catch (err) {
+    if (version === requestVersion) $('#persona').textContent = 'Sandra could not load the search. Try again.';
+  } finally {
+    if (version === requestVersion) $('#grid').removeAttribute('aria-busy');
+  }
 }
-
-$('#search-form').addEventListener('submit', (e) => { e.preventDefault(); run($('#q').value.trim()); });
-$('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run($('#q').value.trim()); } });
+const query = $('#q');
+$('#search-form').addEventListener('submit', (e) => { e.preventDefault(); run(query.value.trim()); });
+query.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run(query.value.trim()); }
+});
 $('#sort').addEventListener('change', renderGrid);
-run($('#q').value.trim());
+$('#required-mode').onclick = (e) => {
+  markRequired = !markRequired;
+  e.currentTarget.setAttribute('aria-pressed', String(markRequired));
+  e.currentTarget.textContent = markRequired ? 'Done marking must-haves' : 'Mark must-haves';
+  if (markRequired) $('#persona').textContent = 'Choose any access preference the home must already have.';
+};
+document.querySelectorAll('[data-example]').forEach((b) => { b.onclick = () => { query.value = b.dataset.example; query.focus(); }; });
+try {
+  if (performance.getEntriesByType('navigation')[0]?.type === 'back_forward') query.value = sessionStorage.getItem('fd-search-query') || '';
+} catch {}
+if (query.value.trim()) run(query.value.trim());
+else run('', { needs: [], required: [], rent: rent ? true : null });

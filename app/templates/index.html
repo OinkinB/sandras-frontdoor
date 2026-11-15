@@ -1,43 +1,42 @@
 {% extends "base.html" %}
-{% block title %}Sandra's FrontDoor · Find a home that truly fits your life{% endblock %}
+{% block title %}FrontDoor · Find a home with Sandra{% endblock %}
 {% block body %}
-<main class="max-w-[1500px] mx-auto px-4 md:px-8 py-6 md:py-8">
-  <section class="relative overflow-hidden rounded-[28px] bg-white shadow-card grid lg:grid-cols-[1.05fr_1fr] min-h-[340px]">
-    <div class="relative z-10 p-7 md:p-12 flex flex-col justify-center">
-      <h1 class="text-3xl md:text-[44px] leading-[1.05] font-extrabold tracking-tight">What do you need in a home?</h1>
-      <form id="search-form" class="mt-7 flex items-start gap-3 bg-white rounded-2xl border border-slate-200 shadow-card p-3 pl-4 max-w-2xl">
-        <svg class="w-7 h-7 mt-1 shrink-0 text-brand-500" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.8 5.4L19 9l-5.2 1.6L12 16l-1.8-5.4L5 9l5.2-1.6zM19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9z"/></svg>
-        <textarea id="q" rows="2" class="flex-1 resize-none outline-none text-[17px] leading-snug placeholder:text-slate-400 py-1"
-          placeholder="Describe what you need…">I use a wheelchair and need a home with no stairs, wide doorways and a walk-in shower in Houston, under $400,000</textarea>
-        <button class="shrink-0 w-12 h-12 rounded-full bg-ink text-white grid place-items-center hover:bg-brand-700 transition" aria-label="Search">
-          <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-        </button>
+<main class="sandra-search max-w-[1500px] mx-auto px-4 md:px-8">
+  <section class="search-hero">
+    <div class="search-hero-visual" aria-hidden="true"><img id="hero-img" src="{{ url_for('static', filename='img/frontdoor-home.jpg') }}" alt=""><div></div></div>
+    <div class="search-hero-copy">
+      <div class="sandra-kicker"><span class="status-light"></span>Sandra</div>
+      <h1>A home that<br>fits your life.</h1>
+      <p>Tell me where you’re looking, your budget, and what the home must already have.</p>
+      <form id="search-form" class="sandra-input">
+        <label for="q" class="sr-only">Tell Sandra what you need in a home</label>
+        <textarea id="q" rows="2" placeholder="For example, a single-level home in Houston under $400,000…"></textarea>
+        <button class="sandra-primary">Find homes <span aria-hidden="true">↗</span></button>
       </form>
-      <div id="chips" class="mt-4 flex flex-wrap gap-2.5"></div>
-      <p id="persona" class="mt-4 text-sm text-slate-500 min-h-[1.25rem]"></p>
-    </div>
-    <div class="relative hidden lg:block">
-      <img id="hero-img" alt="" class="absolute inset-0 w-full h-full object-cover opacity-0 transition-opacity duration-700">
-      <div class="absolute inset-0 bg-gradient-to-r from-white via-white/30 to-transparent"></div>
+      <div class="search-examples" aria-label="Search examples">
+        <button type="button" data-example="Step-free entry and a main-floor bedroom in Houston under $400,000.">Step-free living</button>
+        <button type="button" data-example="I'm hard of hearing and need a quiet home with visual alerts in Los Angeles.">Hearing access</button>
+        <button type="button" data-example="I have low vision and need even lighting, simple circulation and lever handles in Houston.">Lighting and handles</button>
+      </div>
+      <p id="persona" role="status"></p>
     </div>
   </section>
-
-  <section id="results" class="mt-10">
+  <section class="search-preferences" aria-label="Accessibility filters">
+    <div class="flex items-center flex-wrap gap-3 justify-between">
+      <h2>Access preferences</h2>
+      <button type="button" id="required-mode" class="sandra-secondary" aria-pressed="false">Mark must-haves</button>
+    </div>
+    <div id="chips" class="flex flex-wrap gap-2"></div>
+  </section>
+  <section id="results" class="search-results">
     <div class="flex flex-wrap items-end justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <span class="w-11 h-11 rounded-2xl bg-brand-50 grid place-items-center text-brand-600">
-          <svg class="w-6 h-6" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.8 5.4L19 9l-5.2 1.6L12 16l-1.8-5.4L5 9l5.2-1.6z"/></svg></span>
-        <div>
-          <h2 class="text-2xl font-bold tracking-tight">Matches</h2>
-          <p id="result-sub" class="text-slate-500 text-sm"></p>
-        </div>
-      </div>
-      <label class="text-sm text-slate-600">Sort by
-        <select id="sort" class="ml-1 font-semibold bg-transparent outline-none">
-          <option value="match">Best match</option><option value="true">Lowest true cost</option><option value="mods">Fewest changes</option>
+      <div><h2>Homes to explore</h2><p id="result-sub" role="status"></p></div>
+      <label class="search-sort">Sort by
+        <select id="sort">
+          <option value="match">Best fit</option><option value="true">Lowest estimated total</option><option value="mods">Lowest estimated changes</option>
         </select></label>
     </div>
-    <div id="grid" class="mt-6 grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"></div>
+    <div id="grid" class="mt-5 grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"></div>
   </section>
 </main>
 {% endblock %}

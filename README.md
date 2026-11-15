@@ -8,6 +8,92 @@ photo-realistically and in place, what it would look like with the changes you n
 Built at HackPrinceton 2026 for the CoStar track, using CoStar/Homes.com listing data, Matterport 3D tours and Vexcel
 aerial imagery.
 
+## Sandra experience and implementation notes
+
+### Search and fit
+
+- The search starts with an empty prompt and editable examples for mobility, hearing, vision and dexterity.
+  The same interface works for buying and renting. The buyer can mark any access preference as a must-have.
+- `app/blueprints/api.py` applies the stated listing-price ceiling directly. For must-haves, it excludes
+  listings with contradictory evidence, ranks with supporting evidence first, and labels the remaining
+  candidates with exactly what still needs confirmation. This keeps major structural problems in search
+  rather than presenting them as routine remodels during the tour.
+- `app/services/listings.py` and `app/services/ai.py` recognize lever hardware, visual alerts, even lighting
+  and quiet spaces alongside the existing movement and aging-in-place signals. An imprecise listing claim
+  is treated as a clue and measured door width still needs confirmation.
+
+### Fixture recognition and previews
+
+- `/api/home/<id>/agent/objects` inventories up to four original photos at a time. Vision returns individual
+  objects, tight normalized boxes, confidence and parent relationships. A vanity cabinet, basin, countertop
+  and faucet can each be selected. A door and its handle are separate. Reflections and uncertain detections
+  are excluded. The endpoint validates results and atomically caches labels and boxes per home and registered
+  camera angle, without storing the submitted photos in the object cache.
+- `app/static/js/inventory.js` keeps a bounded per-listing index in the browser. It links observations by the
+  same view or by type, room and nearby unambiguous scan coordinates. An object without sufficient depth
+  evidence remains a local observation. "Objects in view" lets the buyer see and spotlight indexed parts.
+- Duplicate handling runs after resolving the target and compares object identity, part and edit intent.
+  The tour acknowledges an existing plan item instead of proposing it again. An explicit revision can
+  replace it after the new preview verifies. Proximity alone does not turn a shower into a duplicate vanity.
+- Manual and guided edits share the same renderer. The original scan anchors the fixture and the exact read-only
+  image for each camera is captured by a separate Showcase instance. New views are matched to the fixture
+  with scan projection, visibility checks, and the indexed parts before image generation. Alternate photographs
+  are appearance references only. The edited pixels are limited to the confirmed region, and each angle
+  needs its own review for placement, occlusion, geometry and seams. For angled cabinet faces, a validated
+  polygon mask protects neighboring walls and floor more precisely than an enclosing rectangle.
+- Direct neighbors are prepared first. On arrival at another eligible, unprepared scan point, Sandra queues
+  that angle once the user settles. It uses the saved original photo and edit brief even after reload.
+  Existing approved patches are reused, failed attempts are rate limited and **Check this angle** can retry.
+  The original view is shown for blocked, pending or failed angles and during movement. Showcase previews
+  represent registered scan points. A continuous remodeled mesh would require a different reconstruction system.
+- For the sink shown in the demo, explicitly asking for only the counter and sink removes the entire base
+  under the same countertop. The prompt calls for protected recessed plumbing and concealed support, a
+  finished floor, and clear knee/toe space. The reviewer rejects remaining cabinet frames and smeared floor.
+  Preview images illustrate the idea and do not establish structural feasibility or clearance measurements.
+
+### Guided tour and interface
+
+- `app/templates/base.html`, `index.html`, `home.html` and `app/static/css/sandra.css` introduce the
+  charcoal-and-mint search and tour interface. The dark dock keeps the current decision, room, progress,
+  angle status, and composer together. The transcript, report button, comparison, plan totals, drawers,
+  room navigation, spotlight, and keyboard controls remain available. The dock stacks below the tour on
+  narrow screens, and motion respects the operating system preference.
+- `app/static/img/frontdoor-home.jpg` is an unedited kitchen view from the hackathon Matterport tour.
+  It keeps the search header usable while a listing photograph is still loading.
+- The tour gathers original views while moving and turning through the existing scan path. It uses room-local
+  evidence and the buyer's preferences, opens the current proposal alongside its spotlight, and offers
+  **Preview change**, **Refine with Sandra**, **Skip** and **End tour**.
+- Refinement uses the original frame and the buyer's reply. A price or complexity objection asks a follow-up
+  before proceeding. A stated installation cap filters the revised choices. A buyer can preserve a doorway and
+  change only the handle, or skip the project. Unsolicited structural work is surfaced as a fit concern.
+- `app/static/js/sandra-rover.js` adds a Three.js scene component through the existing Showcase SDK.
+  Sandra rolls, turns, reverses, blinks, and scans in model coordinates. Guidance follows scan-point paths.
+  Nearby placement uses ground raycasts. A hop is available only for a short, low, level surface supported
+  by multiple scene hits. The rover uses the scan for placement rather than a general collision simulator.
+- The supplied style playbook informed the live character, strong silhouette, idle animation, depth and clear
+  controls. FrontDoor uses its own web layout, palette and typography.
+
+### Reproduce the bathroom and proposal flows
+
+1. Start the local app using the setup below. Search for a single-level Houston home, mark step-free entry
+   or another required feature, and open a result with supporting or clearly labeled incomplete evidence.
+2. In the 3D tour, open **Objects in view** to inspect individual fixture parts. Circle a sink and say
+   “remove every cabinet below this countertop, keep this sink and faucet, and leave room to roll underneath.”
+3. Compare the before and after at the current scan point. Step to the doorway, wait for Sandra's angle
+   status, and check that the original is shown if the fixture is blocked or a rendering did not verify.
+4. Start a guided tour, refine a proposal in the composer, set an installation budget or request a hardware-only
+   change, preview it, and then review the plan. Reopen the home to verify saved edits and reuse of approvals.
+5. Use **Scout with Sandra** at a suitable low platform to test hop detection. On flat floors, the rover
+   stays on the floor. Imported listing/scan data and provider credentials remain in their existing locations.
+
+### Validation
+
+The browser walkthrough uses the real Matterport model and local stand-ins for the AI providers. It checks the
+custom search, must-have filters, index reuse and spotlighting, the 3D rover, a revised suggestion's cost cap,
+the preview and saved plan, and background doorway capture without moving the visitor camera. This exercises the
+whole application flow without transmitting the bathroom screenshot to an additional service or charging AI credits.
+Generated image quality still needs a provider-backed check.
+
 ---
 
 ## The problem we're solving

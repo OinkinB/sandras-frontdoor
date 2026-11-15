@@ -7,7 +7,7 @@
  *  4. Gemini edits the photo; the edit is projected back into the tour from that exact scan point.
  *  5. An independent reviewer (OpenAI, Gemini fallback) checks before/after; if it's not a clear, finished,
  *     believable result it is re-rendered with the reviewer's fix (up to 2 retries).
- *  6. When ready you get a card with "Show me"; walking to other spots re-renders it from there.
+ *  6. A second viewer pre-renders verified edits for neighboring scan points from their original photos.
  */
 const H = window.HOME;
 const NEEDS = (new URLSearchParams(location.search).get('needs') || '').split(',').filter(Boolean);
@@ -23,30 +23,36 @@ const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<
 
 let sdk = null, info = null;
 let mode = 'walk', view = 'after';
-let poseCache = null, lastSweep = null;
+let poseCache = null, lastSweep = null, stationedSweep = '';
 let selections = [];
 let edits = [];
 const live = {};                 // editId -> {patches: {sweepId: node}}
 const selFor = new Map();        // editId -> selection (frozen frame, kept in memory)
-const pending = new Set();
 let chatHistory = [];
 let agentBusy = false, agentAbort = false;
 const keyOf = (room, title) => `${room}|${String(title).toLowerCase()}`;
 const declined = new Set((() => { try { return JSON.parse(localStorage.getItem(`frontdoor-declined-${window.HOME.id}`) || '[]'); } catch { return []; } })());
 const saveDeclined = () => { try { localStorage.setItem(`frontdoor-declined-${H.id}`, JSON.stringify([...declined])); } catch {} };
 // Everything the agent should know about what's already been done in this home
-const stateForAgent = () => edits.filter((x) => x.status !== 'failed').map((x) => ({ room: x.room, change: x.title, replaced: x.item, product: x.option?.name, shown: x.on !== false, status: x.status }));
+const stateForAgent = (roomId) => edits.filter((x) => x.status === 'ready').map((x) => ({
+  room: x.room, same_room: x.roomId === roomId, object_id: x.objectId, kind: x.kind,
+  change: x.title, replaced: x.item, product: x.option?.name, shown: x.on !== false,
+}));
 
 /* ================= boot ================= */
 const iframe = $('#showcase');
-iframe.src = `/bundle/showcase.html?m=${H.matterport_id}&play=1&qs=1&brand=0&help=0&mls=2&applicationKey=${encodeURIComponent(window.SDK_KEY)}`;
+const showcaseUrl = `/bundle/showcase.html?m=${H.matterport_id}&play=1&qs=1&brand=0&help=0&mls=2&applicationKey=${encodeURIComponent(window.SDK_KEY)}`;
+iframe.src = showcaseUrl;
 iframe.addEventListener('load', async () => {
   try {
     sdk = await iframe.contentWindow.MP_SDK.connect(iframe.contentWindow);
     await new Promise((res) => { const sub = sdk.App.state.subscribe((s) => { if (s.phase === sdk.App.Phase.PLAYING) { res(); setTimeout(() => sub.cancel()); } }); });
     window.hmSdk = sdk;
     await sdk.Scene.register('fd.photo', () => new PhotoPatch());
+    await sdk.Scene.register('fd.sandra', () => new SandraRover());
+    rover = await addNode('fd.sandra', { shown: false, reduced: reducedRoverMotion.matches });
     await loadRooms();
+    sdk.Sweep.current.subscribe((s) => { stationedSweep = s.id || s.sid || ''; refreshVisibility(); scheduleCoverage(); });
     sdk.Camera.pose.subscribe(onPose);
     await restoreEdits();
     hint('Drag to look around. Click <b>✎ Change something</b> to reimagine any spot.', 6000);
@@ -55,7 +61,7 @@ iframe.addEventListener('load', async () => {
 });
 
 /* ================= photo patches ================= */
-function PhotoPatch() {   // edited photo, projected along the camera rays it was taken with
+function PhotoPatch() {
   this.inputs = { url: '', corners: [], visible: true };
   this.onInit = function () {
     const T = this.context.three, c = this.inputs.corners;
@@ -63,45 +69,65 @@ function PhotoPatch() {   // edited photo, projected along the camera rays it wa
     geo.setAttribute('position', new T.Float32BufferAttribute([c[0], c[1], c[2], c[3]].flatMap((p) => [p.x, p.y, p.z]), 3));
     geo.setAttribute('uv', new T.Float32BufferAttribute([0, 1, 1, 1, 1, 0, 0, 0], 2));
     geo.setIndex([0, 3, 1, 1, 3, 2]);
-    const tex = new T.TextureLoader().load(this.inputs.url);
+    const tex = new T.TextureLoader().load(this.inputs.url, () => {
+      this.loaded = true;
+      if (this.outputs.objectRoot) this.apply();
+    });
     if ('colorSpace' in tex && T.SRGBColorSpace) tex.colorSpace = T.SRGBColorSpace; else if (T.sRGBEncoding) tex.encoding = T.sRGBEncoding;
     tex.anisotropy = 8;
     this.mesh = new T.Mesh(geo, new T.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, side: T.DoubleSide, toneMapped: false }));
     this.mesh.renderOrder = 3000; this.mesh.frustumCulled = false;
     this.outputs.objectRoot = this.mesh; this.apply();
   };
-  this.apply = function () { this.outputs.objectRoot.visible = this.inputs.visible; };
+  this.apply = function () { this.outputs.objectRoot.visible = !!this.loaded && this.inputs.visible; };
   this.onInputsUpdated = function () { this.apply(); };
+  this.onDestroy = function () {
+    this.mesh.geometry.dispose();
+    this.mesh.material.map.dispose();
+    this.mesh.material.dispose();
+  };
 }
 async function addNode(component, inputs) {
   const [obj] = await sdk.Scene.createObjects(1);
-  const n = obj.addNode(); n.addComponent(component, inputs); obj.start(); return n;
+  const n = obj.addNode();
+  const instance = n.addComponent(component, inputs);
+  obj.start();
+  return { component: instance, stop: () => obj.stop() };
 }
-const comp = (n) => [...n.componentIterator()][0];
 
 /* ================= camera math ================= */
 function rayDir(px, py, pose) {
   const W = pose.W || iframe.clientWidth, Hh = pose.H || iframe.clientHeight, P = pose.projection;
   const nx = (px / W) * 2 - 1, ny = -((py / Hh) * 2 - 1);
-  const x = (nx + (P ? P[8] : 0)) / (P ? P[0] : 1.2), y = (ny + (P ? P[9] : 0)) / (P ? P[5] : 1.2), z = -1;
+  // Showcase stores the projection matrix in row-major order.
+  const x = (nx + (P ? P[2] : 0)) / (P ? P[0] : 1.2), y = (ny + (P ? P[6] : 0)) / (P ? P[5] : 1.2), z = -1;
   const pitch = pose.rotation.x * Math.PI / 180, yaw = pose.rotation.y * Math.PI / 180;
   const y2 = y * Math.cos(pitch) - z * Math.sin(pitch), z2 = y * Math.sin(pitch) + z * Math.cos(pitch);
   const x3 = x * Math.cos(yaw) + z2 * Math.sin(yaw), z3 = -x * Math.sin(yaw) + z2 * Math.cos(yaw);
   const L = Math.hypot(x3, y2, z3);
   return { x: x3 / L, y: y2 / L, z: z3 / L };
 }
-function patchCorners(rectN, pose, d = 0.6) {
+function patchCorners(rectN, pose, anchor) {
   const W = pose.W || iframe.clientWidth, Hh = pose.H || iframe.clientHeight, c = pose.position;
   const fwd = rayDir(W / 2, Hh / 2, pose);
+  const d = anchor ? Math.max(0.25, (anchor.x - c.x) * fwd.x + (anchor.y - c.y) * fwd.y + (anchor.z - c.z) * fwd.z) : 2;
   return [[rectN[0], rectN[1]], [rectN[2], rectN[1]], [rectN[2], rectN[3]], [rectN[0], rectN[3]]].map(([u, v]) => {
     const r = rayDir(u * W, v * Hh, pose), k = d / (r.x * fwd.x + r.y * fwd.y + r.z * fwd.z);
     return { x: c.x + r.x * k, y: c.y + r.y * k, z: c.z + r.z * k };
   });
 }
-const snapPose = (p = poseCache) => ({ sweep: p.sweep, position: { ...p.position }, rotation: { ...p.rotation },
-  projection: p.projection ? Array.from(p.projection) : null, W: iframe.clientWidth, H: iframe.clientHeight });
-async function hitAt(x, y) {
-  try { const d = await sdk.Renderer.getWorldPositionData({ x, y }); return d && d.position ? d.position : null; } catch { return null; }
+const snapPose = (p = poseCache, target = iframe) => ({ sweep: p.sweep, mode: p.mode, position: { ...p.position }, rotation: { ...p.rotation },
+  projection: p.projection ? Array.from(p.projection) : null, W: target.clientWidth, H: target.clientHeight });
+function samePosition(a, b) {
+  return a?.mode === 'mode.inside' && b?.mode === 'mode.inside' && a.sweep === b.sweep && dist(a.position, b.position) < 0.025;
+}
+function sameFrame(a, b) {
+  return samePosition(a, b) && a.W === b.W && a.H === b.H &&
+    Math.abs(((a.rotation.y - b.rotation.y + 540) % 360) - 180) < 0.25 &&
+    Math.abs(a.rotation.x - b.rotation.x) < 0.25 && Math.abs((a.projection?.[5] || 0) - (b.projection?.[5] || 0)) < 0.005;
+}
+async function hitAt(x, y, viewer = sdk) {
+  try { return (await viewer.Renderer.getWorldPositionData({ x, y })).position; } catch { return null; }
 }
 /* Walk to a scan point through its neighbors, like stepping through the house, instead of jumping. */
 async function walkTo(target) {
@@ -112,7 +138,10 @@ async function walkTo(target) {
   const path = [];
   if (target in prev) for (let c = target; c && c !== poseCache.sweep; c = prev[c]) path.unshift(c);
   else path.push(target);
-  for (const id of path.slice(0, 12)) await soon(sdk.Sweep.moveTo(id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 520 }), 2500);
+  for (const id of path.slice(0, 12)) {
+    if (agentBusy) roverToSweep(id);
+    await soon(sdk.Sweep.moveTo(id, { transition: sdk.Sweep.Transition.FLY, transitionTime: 520 }), 2500);
+  }
   if (path.length > 12) await soon(sdk.Sweep.moveTo(target, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }), 3000);
   await sleep(250);
 }
@@ -146,46 +175,64 @@ async function lookAt(rot, speed = 10000) {     // speed in degrees/second; ~90 
   const { dy, dx } = off(); return Math.abs(dy) < 1.5 && Math.abs(dx) < 1.5;
 }
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.max(0, Math.round(p * (s.length - 1))))]; };
-async function worldFromRect(r) {       // fit a house-aligned 3D box to what's inside a screen rectangle
-  const cam = poseCache.position;
-  const center = await hitAt(r.x + r.w / 2, r.y + r.h / 2);
-  if (!center) return null;
-  const N = 6, jobs = [];
-  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) jobs.push(hitAt(r.x + r.w * (0.06 + 0.88 * i / (N - 1)), r.y + r.h * (0.06 + 0.88 * j / (N - 1))));
-  let pts = (await Promise.all(jobs)).filter(Boolean).filter((p) => dist(cam, p) < dist(cam, center) + 1.2);
-  if (pts.length < 4) pts = [center];
-  const yaw = Math.round(Math.atan2(cam.x - center.x, cam.z - center.z) / (Math.PI / 2)) * (Math.PI / 2);
-  const c = Math.cos(yaw), s = Math.sin(yaw);
-  const loc = pts.map((p) => ({ x: (p.x - center.x) * c - (p.z - center.z) * s, z: (p.x - center.x) * s + (p.z - center.z) * c }));
-  const xs = loc.map((p) => p.x), zs = loc.map((p) => p.z), ys = pts.map((p) => p.y);
-  const x0 = pct(xs, 0.08), x1 = pct(xs, 0.92), z0 = pct(zs, 0.08), z1 = pct(zs, 0.92);
-  const camFloor = cam.y - 1.45, yMin = Math.min(...ys);
-  const floorY = Math.abs(yMin - camFloor) < 0.35 ? yMin : Math.min(yMin, camFloor);
-  const w = Math.max(0.2, x1 - x0), d = Math.max(0.2, z1 - z0), h = Math.max(0.2, pct(ys, 0.92) - floorY);
-  const lx = (x0 + x1) / 2, lz = (z0 + z1) / 2;
-  return { center: { x: center.x + lx * c + lz * s, y: floorY + h / 2, z: center.z - lx * s + lz * c }, w, h, d, yaw, floorY, rise: Math.max(...ys) - Math.min(...ys) };
+async function sampleSelection(r, pose) {
+  const samples = [];
+  for (const span of [1, 2.5]) {
+    for (let row = -2; row <= 2; row++) for (let col = -2; col <= 2; col++) {
+      if (span !== 1 && row === 0 && col === 0) continue;
+      const x = r.x + r.w * (0.5 + col * span / 5);
+      const y = r.y + r.h * (0.5 + row * span / 5);
+      if (x >= 0 && x < pose.W && y >= 0 && y < pose.H) samples.push({ x, y });
+    }
+  }
+  const hits = await Promise.all(samples.map(async (s) => ({ ...s, point: await hitAt(s.x, s.y) })));
+  return hits.filter((s) => s.point && Number.isFinite(s.point.x) && dist(s.point, pose.position) > 0.10);
 }
-function projectBox(world, pose = poseCache) {
-  const W = iframe.clientWidth, Hh = iframe.clientHeight, c = Math.cos(world.yaw), s = Math.sin(world.yaw), xs = [], ys = [];
-  for (const dx of [-1, 1]) for (const dy of [-1, 1]) for (const dz of [-1, 1]) {
-    const lx = dx * world.w / 2, lz = dz * world.d / 2;
-    const q = sdk.Conversion.worldToScreen({ x: world.center.x + lx * c + lz * s, y: world.center.y + dy * world.h / 2, z: world.center.z - lx * s + lz * c }, pose, { w: W, h: Hh });
-    if (!q || q.z > 1 || q.z < -1) return null;
+function worldFromRect(r, hits, pose) {
+  const inside = hits.filter((s) => s.x >= r.x && s.x <= r.x + r.w && s.y >= r.y && s.y <= r.y + r.h);
+  if (!inside.length) return null;
+  const distanceToMiddle = (s) => Math.hypot((s.x - r.x) / r.w - 0.5, (s.y - r.y) / r.h - 0.5);
+  const seed = [...inside].sort((a, b) => distanceToMiddle(a) - distanceToMiddle(b))[0].point;
+  const depth = dist(pose.position, seed);
+  const tolerance = Math.max(0.45, Math.min(1.2, depth * 0.35));
+  const points = inside.map((s) => s.point).filter((p) => Math.abs(dist(pose.position, p) - depth) < tolerance);
+  const bounds = ['x', 'y', 'z'].map((axis) => {
+    const coords = points.map((p) => p[axis]);
+    return [pct(coords, 0.04), pct(coords, 0.96)];
+  });
+  const [[x0, x1], [y0, y1], [z0, z1]] = bounds;
+  return { center: { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z: (z0 + z1) / 2 },
+    w: Math.max(0.25, x1 - x0), h: Math.max(0.25, y1 - y0), d: Math.max(0.25, z1 - z0), points };
+}
+function projectBox(world, pose, viewer, { w: W, h: Hh }) {
+  const xs = [], ys = [];
+  const screen = (p) => viewer.Conversion.worldToScreen(p, pose, { w: W, h: Hh });
+  for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) {
+    const q = screen({ x: world.center.x + x * world.w / 2, y: world.center.y + y * world.h / 2, z: world.center.z + z * world.d / 2 });
+    if (!q || !Number.isFinite(q.x + q.y + q.z) || q.z > 1 || q.z < -1) return null;
     xs.push(q.x); ys.push(q.y);
   }
-  const full = (Math.max(...xs) - Math.min(...xs)) * (Math.max(...ys) - Math.min(...ys));
+  const width = Math.max(...xs) - Math.min(...xs), height = Math.max(...ys) - Math.min(...ys);
   const r = { x0: Math.max(0, Math.min(...xs)), y0: Math.max(0, Math.min(...ys)), x1: Math.min(W, Math.max(...xs)), y1: Math.min(Hh, Math.max(...ys)) };
-  if (r.x1 - r.x0 < 50 || r.y1 - r.y0 < 50 || (r.x1 - r.x0) * (r.y1 - r.y0) < 0.3 * full) return null;
+  if (r.x1 - r.x0 < 30 || r.y1 - r.y0 < 30 || (r.x1 - r.x0) * (r.y1 - r.y0) < 0.6 * width * height) return null;
   return r;
 }
 
 /* ================= rooms ================= */
 let sweepList = [], roomList = [], roomIdx = 0;
 async function collect(obs) {
-  const out = []; let sub;
-  await Promise.race([new Promise((r) => { sub = obs.subscribe({ onCollectionUpdated: (c) => { const v = Object.values(c); if (v.length) { out.splice(0, out.length, ...v); r(); } } }); }), sleep(10000)]);
-  setTimeout(() => sub?.cancel?.());
-  return out;
+  let latest = [], settle, timeout, sub;
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(settle); clearTimeout(timeout); sub?.cancel?.(); resolve(latest); };
+    timeout = setTimeout(done, 6500);
+    sub = obs.subscribe({ onCollectionUpdated: (collection) => {
+      const batch = Object.values(collection);
+      if (!batch.length) return;
+      latest = batch;
+      clearTimeout(settle);
+      settle = setTimeout(done, 420);
+    } });
+  });
 }
 async function loadRooms() {
   sweepList = await collect(sdk.Sweep.data);
@@ -197,6 +244,9 @@ async function loadRooms() {
   const bySweep = {};
   for (const s of sweepList) if (s.roomInfo?.id) (bySweep[s.roomInfo.id] ||= []).push(s);
   roomList = rooms.filter((r) => r.label && bySweep[r.id]).map((r) => ({ id: r.id, label: r.label.split(/,| \/ /)[0].trim(), sweeps: bySweep[r.id] }));
+  if (!roomList.length) {
+    roomList = Object.entries(bySweep).map(([id, sweeps], index) => ({ id, label: 'Room ' + (index + 1), sweeps }));
+  }
   const n = {}; roomList.forEach((r) => { n[r.label] = (n[r.label] || 0) + 1; r.k = n[r.label]; });
   roomList.forEach((r) => { if (n[r.label] > 1) r.label += ' ' + r.k; });
   $('#room-nav').classList.toggle('hidden', !roomList.length);
@@ -221,82 +271,298 @@ $('#room-name').onclick = () => {
   m.classList.toggle('hidden');
 };
 
-/* ================= pose: show patches for this spot, re-render where useful ================= */
-let settleTimer = null;
+/* ================= scan-point previews ================= */
 function onPose(p) {
   poseCache = p;
+  if (rover && p.mode !== 'mode.inside') rover.component.inputs.shown = false;
   if (p.sweep !== lastSweep) {
     lastSweep = p.sweep;
     const r = currentRoom(); if (r) roomIdx = roomList.indexOf(r);
     $('#room-name').textContent = r ? r.label : 'Between rooms';
-    refreshVisibility();
+    scheduleCoverage();
+    if (!agentBusy && p.mode === 'mode.inside') setTimeout(() => setRoverState('idle'), 450);
   }
-  overlay.querySelectorAll('.sel-box').forEach((e) => e.remove());   // 2D outlines only make sense for the view they were drawn in
+  refreshVisibility();
+  overlay.querySelectorAll('.sel-box').forEach((e) => e.remove());
   if (spotFor && (p.sweep !== spotFor.sweep || Math.abs(((p.rotation.y - spotFor.rot.y + 540) % 360) - 180) + Math.abs(p.rotation.x - spotFor.rot.x) > 2)) clearSpot();
   if (mode === 'select') hideMenu();
-  clearTimeout(settleTimer);
-  settleTimer = setTimeout(renderMissingViews, 1100);
+  if (mode === 'walk' && edits.some((e) => e.source && !e.patches.some((patch) => patch.sweep === p.sweep))) scheduleCoverage();
 }
 function refreshVisibility() {
-  for (const e of edits) for (const [sw, n] of Object.entries(live[e.id]?.patches || {})) {
-    comp(n).inputs.visible = view === 'after' && sw === lastSweep && e.on !== false && e.status === 'ready';
-    comp(n).onInputsUpdated();
-  }
-}
-async function renderMissingViews() {
-  if (!sdk || agentBusy || view !== 'after' || !poseCache) return;
-  const pose = poseCache, W = iframe.clientWidth, Hh = iframe.clientHeight;
   for (const e of edits) {
-    if (e.on === false || !e.world || e.status !== 'ready' || e.patches.some((p) => p.sweep === pose.sweep)) continue;
-    const key = `${e.id}@${pose.sweep}`, d = dist(pose.position, e.world.center);
-    const sameRoom = e.roomId && currentRoom()?.id === e.roomId;
-    if (pending.has(key) || d > 4.5 || (!sameRoom && d > 2.5)) continue;
-    const r = projectBox(e.world, pose);
-    if (!r || (r.x1 - r.x0) < 160 || (r.y1 - r.y0) < 140 || (r.x1 - r.x0) * (r.y1 - r.y0) < 0.06 * W * Hh) continue;
-    let clear = 0;
-    for (const [u, v] of [[0.5, 0.5], [0.3, 0.35], [0.7, 0.35], [0.3, 0.7], [0.7, 0.7]]) {
-      const hit = await hitAt(r.x0 + (r.x1 - r.x0) * u, r.y0 + (r.y1 - r.y0) * v);
-      if (hit && dist(pose.position, hit) > d - Math.max(e.world.w, e.world.d) * 0.75) clear++;
+    for (const p of e.patches) {
+      const component = live[e.id]?.patches[p.sweep]?.component;
+      if (!component) continue;
+      const visible = !capturingOriginal && view === 'after' && e.on !== false && e.status === 'ready' &&
+        stationedSweep === p.sweep && samePosition(p.pose, poseCache);
+      if (component.inputs.visible !== visible) component.inputs.visible = visible;
     }
-    if (clear < 4 || pose.sweep !== poseCache.sweep) continue;
-    pending.add(key);
-    const card = jobCard({ id: key, title: `Showing “${e.title}” from here`, step: 'Rendering this angle', pct: 60, busy: true });
-    try { await renderPatch(e, r, snapPose(pose), null, null); e.patches.at(-1).extra = true; save(); }
-    catch (err) { console.warn(err); }
-    pending.delete(key); card.remove(); refreshVisibility();
   }
 }
 
+let captureQueue = Promise.resolve();
+let capturingOriginal = false;
+function nearbySweeps(e, origin) {
+  const byId = new Map(sweepList.map((s) => [s.id, s]));
+  const source = byId.get(origin);
+  if (!source || !e.world?.points.length) return [];
+  const seen = new Set([origin]), queue = [{ sweep: source, steps: 0 }], candidates = [];
+  for (const { sweep, steps } of queue) {
+    if (steps === 2) continue;
+    for (const id of sweep.neighbors || []) {
+      const next = byId.get(id);
+      if (!next || seen.has(id) || next.floorInfo?.id !== source.floorInfo?.id) continue;
+      seen.add(id);
+      queue.push({ sweep: next, steps: steps + 1 });
+      if (dist(next.position, e.world.center) < 4.5) candidates.push({ sweep: next, steps: steps + 1 });
+    }
+  }
+  return candidates.sort((a, b) => a.steps - b.steps ||
+    dist(a.sweep.position, e.world.center) - dist(b.sweep.position, e.world.center)).slice(0, 5).map((c) => c.sweep);
+}
+function queueNearbyCapture(e, pose, revision, sweeps = nearbySweeps(e, pose.sweep)) {
+  if (!sweeps.length) return Promise.resolve([]);
+  const capture = captureQueue.then(() => activeEdit(e, revision) ? captureNearby(e, sweeps, revision) : []);
+  captureQueue = capture.catch((err) => {
+    console.warn('Nearby preview capture failed:', err);
+    return [];
+  });
+  return captureQueue;
+}
+async function captureNearby(e, sweeps, revision) {
+  // Showcase pauses painting when fully hidden. Expose two pixels without covering the live tour.
+  const frame = document.createElement('iframe');
+  frame.className = 'sandra-scout absolute inset-0 w-full h-full pointer-events-none';
+  frame.style.cssText = 'z-index:1;border:0;clip-path:inset(calc(100% - 2px) 0 0 calc(100% - 2px))';
+  frame.setAttribute('aria-hidden', 'true');
+  frame.tabIndex = -1;
+  let poses, state, current;
+  try {
+    const loaded = new Promise((resolve) => frame.addEventListener('load', resolve, { once: true }));
+    frame.src = showcaseUrl;
+    iframe.before(frame);
+    const viewer = await soon(loaded.then(() => frame.contentWindow.MP_SDK.connect(frame.contentWindow)), 20000);
+    if (!viewer) throw new Error('Background tour did not connect');
+    const ready = await soon(new Promise((resolve) => {
+      state = viewer.App.state.subscribe((s) => { if (s.phase === viewer.App.Phase.PLAYING) resolve(true); });
+    }), 20000);
+    if (!ready) throw new Error('Background tour did not start');
+    let pose, stationed = '';
+    poses = viewer.Camera.pose.subscribe((p) => { pose = p; });
+    current = viewer.Sweep.current.subscribe((s) => { stationed = s.id || s.sid || ''; });
+    const views = [];
+    for (const sweep of sweeps) {
+      if (!activeEdit(e, revision) || views.length === 3) break;
+      const dx = e.world.center.x - sweep.position.x, dy = e.world.center.y - sweep.position.y, dz = e.world.center.z - sweep.position.z;
+      const rotation = { x: Math.atan2(dy, Math.hypot(dx, dz)) * 180 / Math.PI, y: Math.atan2(-dx, -dz) * 180 / Math.PI };
+      const moved = await soon(viewer.Sweep.moveTo(sweep.id, { rotation, transition: viewer.Sweep.Transition.INSTANT }).then(() => true), 6500);
+      if (!moved) break;
+      const atSweep = () => stationed === sweep.id && pose?.sweep === sweep.id && pose.mode === 'mode.inside';
+      for (let i = 0; i < 15 && !atSweep(); i++) await sleep(100);
+      if (!atSweep()) continue;
+      await sleep(350);
+      for (let attempt = 0; attempt < 2 && atSweep() && activeEdit(e, revision); attempt++) {
+        // Keep the SDK's native typed projection for its conversion functions.
+        const sdkPose = pose;
+        const snap = snapPose(sdkPose, frame);
+        const size = { w: snap.W, h: snap.H };
+        const box = projectBox(e.world, sdkPose, viewer, size);
+        if (!box) break;
+        const hits = await visiblePoints(e.world, sdkPose, viewer, size);
+        if (hits.length < 2) break;
+        const image = await captureReadyFrame(viewer, frame);
+        if (!image || !atSweep() || !sameFrame(snap, snapPose(pose, frame))) {
+          await sleep(225);
+          continue;
+        }
+        const hint = [box.y0 / snap.H, box.x0 / snap.W, box.y1 / snap.H, box.x1 / snap.W].map((n) => Math.round(n * 1000));
+        views.push({ image, pose: snap, hint, hits, roomId: sweep.roomInfo?.id || e.roomId });
+        break;
+      }
+    }
+    return views;
+  } finally {
+    poses?.cancel();
+    state?.cancel();
+    current?.cancel();
+    frame.remove();
+  }
+}
+async function captureReadyFrame(viewer, frame) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 24;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  for (const delay of [350, 600, 900, 1250, 1500, 0]) {
+    const image = await soon(grabFrame(viewer, frame), 4500);
+    if (!image) break;
+    const img = new Image();
+    img.src = image;
+    await img.decode();
+    ctx.drawImage(img, 0, 0, 24, 24);
+    const data = ctx.getImageData(0, 0, 24, 24).data;
+    let lit = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (Math.max(data[i], data[i + 1], data[i + 2]) > 55) lit++;
+    }
+    if (lit >= 12) return image;
+    if (delay) await sleep(delay);
+  }
+  return null;
+}
+async function visiblePoints(world, pose, viewer, size) {
+  const step = Math.max(1, Math.floor(world.points.length / 9));
+  const candidates = world.points.filter((_, i) => i % step === 0).slice(0, 16);
+  const hits = await Promise.all(candidates.map(async (p) => {
+    const q = viewer.Conversion.worldToScreen(p, pose, size);
+    if (!q || q.z < -1 || q.z > 1 || q.x < 0 || q.y < 0 || q.x >= size.w || q.y >= size.h) return null;
+    const hit = await hitAt(q.x, q.y, viewer);
+    return hit && dist(hit, p) < 0.24 ? { x: q.x, y: q.y, point: p } : null;
+  }));
+  return hits.filter(Boolean);
+}
+function boxRect(box, pose) {
+  if (!Array.isArray(box) || box.length !== 4 || !box.every((n) => Number.isFinite(n) && n >= 0 && n <= 1000)) return null;
+  const [y0, x0, y1, x1] = box;
+  if (x1 - x0 < 10 || y1 - y0 < 10) return null;
+  return { x: x0 / 1000 * pose.W, y: y0 / 1000 * pose.H, w: (x1 - x0) / 1000 * pose.W, h: (y1 - y0) / 1000 * pose.H };
+}
+function covers(outer, inner, fraction) {
+  if (!outer || !inner) return false;
+  const w = Math.max(0, Math.min(outer.x + outer.w, inner.x + inner.w) - Math.max(outer.x, inner.x));
+  const h = Math.max(0, Math.min(outer.y + outer.h, inner.y + inner.h) - Math.max(outer.y, inner.y));
+  return w * h >= fraction * inner.w * inner.h;
+}
+function angleRect(f, pose, scope) {
+  const target = isObjectRect(f.box_2d, pose);
+  const rect = scope === 'roll_under_sink' ? isObjectRect(f.edit_box_2d, pose) : target;
+  return covers(target, rect, 0.92) ? { target, rect } : null;
+}
+function editPolygon(f, pose, r) {
+  const poly = f.edit_polygon_2d;
+  if (!r || !Array.isArray(poly) || poly.length < 4 || poly.length > 16) return null;
+  if (poly.some((p) => !Array.isArray(p) || p.length !== 2 || p.some((n) => !Number.isFinite(n) || n < 0 || n > 1000))) return null;
+  const points = poly.map(([y, x]) => [x / 1000, y / 1000]);
+  if (!points.every(([x, y]) => x * pose.W >= r.x - 6 && x * pose.W <= r.x + r.w + 6 &&
+    y * pose.H >= r.y - 6 && y * pose.H <= r.y + r.h + 6)) return null;
+  const area = Math.abs(points.reduce((sum, [x, y], i) => {
+    const [u, v] = points[(i + 1) % points.length];
+    return sum + x * v - y * u;
+  }, 0)) * pose.W * pose.H / 2;
+  return area >= r.w * r.h * 0.25 ? points : null;
+}
+function paddedRect(r, pose, padding = 0.015) {
+  const pad = padding * Math.max(r.w, r.h);
+  const x = Math.max(0, r.x - pad), y = Math.max(0, r.y - pad);
+  return { x, y, w: Math.min(pose.W, r.x + r.w + pad) - x, h: Math.min(pose.H, r.y + r.h + pad) - y };
+}
+async function locateNearby(e, sel, views, revision) {
+  if (!views.length || !activeEdit(e, revision)) return [];
+  const source = await annotate({ frame: sel.frame, pose: sel.pose, rect: sel.targetRect || sel.rect });
+  if (!source) return [];
+  const observations = await identifyViews(views).catch(() => []);
+  const result = await postEdit('agent/locate-angles', {
+    source, item: e.item || e.title, scope: e.scope, clear_cabinet: e.clearCabinet,
+    views: views.map(({ image, hint }, i) => ({ image, hint, objects: (observations[i] || []).slice(0, 40) })),
+  });
+  const angles = [];
+  for (const [i, v] of views.entries()) {
+    const f = (result.angles || []).find((a) => a.view === i);
+    const located = f && angleRect(f, v.pose, e.scope);
+    if (!located || !covers(boxRect(v.hint, v.pose), located.target, 0.35)) continue;
+    const r = paddedRect(located.target, v.pose, 0.1);
+    const aligned = v.hits.filter(({ x, y }) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h);
+    if (aligned.length < 2) continue;
+    const fixture = recognized[e.objectId];
+    if (fixture) {
+      fixture.views[viewKey(v.pose)] = [e.scope === 'roll_under_sink' ? f.edit_box_2d : f.box_2d];
+      fixture.touched = Date.now();
+    }
+    angles.push({ frame: v.image, pose: v.pose, rect: located.rect, targetRect: located.target,
+      poly: editPolygon(f, v.pose, located.rect), extra: true });
+  }
+  if (angles.length) saveInventory();
+  return angles;
+}
+
 /* ================= rendering ================= */
-async function grabFrame() {
-  const W = iframe.clientWidth, Hh = iframe.clientHeight, k = Math.min(2, 1600 / W);
-  return sdk.Renderer.takeScreenShot({ width: Math.round(W * k), height: Math.round(Hh * k) }, { mattertags: false, sweeps: false });
+async function grabFrame(viewer = sdk, target = iframe) {
+  const W = target.clientWidth, Hh = target.clientHeight, k = Math.min(2, 1600 / W);
+  return viewer.Renderer.takeScreenShot({ width: Math.round(W * k), height: Math.round(Hh * k) }, {
+    mattertags: false, sweeps: false, measurements: false, views: false,
+  });
 }
 function taskText(e) {
-  const what = e.custom || (e.option ? `${e.option.name} (${e.option.spec})` : e.title);
-  if (e.action === 'remove') return `Remove ${e.item || 'the selected item'} completely and fill the space with the surrounding floor and wall. ${e.custom || ''}`;
-  if (e.action === 'add') return `Install ${what}. Purpose: ${e.title}.`;
-  return `Replace ${e.item || 'what is in the masked area'} with ${what}. Purpose: ${e.title}.`;
+  const what = e.custom || (e.option ? e.option.name + ' (' + e.option.spec + ')' : e.title);
+  if (e.scope === 'roll_under_sink') {
+    const open = 'Keep the existing countertop, basin, faucet, wall, and height. Create a full-height, full-depth opening under the basin with finished floor and protected, recessed plumbing.';
+    if (e.clearCabinet) return open + ' Remove ALL base cabinets and cabinet frames under this countertop. Use discreet wall brackets or concealed support. Keep the whole area open with no shelves, doors, cabinets, furniture legs or toe-kick.';
+    return open + ' Keep cabinetry outside the requested opening.';
+  }
+  if (e.action === 'remove') return 'Remove ' + (e.item || 'the selected item') + ' and continue the surrounding floor and wall. ' + (e.custom || '');
+  if (e.action === 'add') return 'Install ' + what + '. Purpose: ' + e.title + '.';
+  return 'Replace ' + (e.item || 'the selected item') + ' in its existing position with ' + what + '. Purpose: ' + e.title + '.';
 }
-async function renderPatch(e, r, pose, image, poly, fix) {
-  image = image || await grabFrame();
-  const W = pose.W, Hh = pose.H;
-  const meta = await fetch(`/api/home/${H.id}/render`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image, rect: [r.x0 / W, r.y0 / Hh, r.x1 / W, r.y1 / Hh], task: taskText(e), ref: e.ref || null, fix: fix || null,
-      poly: poly ? poly.map(([x, y]) => [x / W, y / Hh]) : null }) }).then((x) => x.json());
-  if (meta.error) throw new Error(meta.error);
-  const p = { sweep: pose.sweep, rid: meta.id, corners: patchCorners(meta.rect, pose), rot: { ...pose.rotation }, rectN: meta.rect };
-  e.patches.push(p); save();
-  await mountPatch(e, p);
-  return meta;
+async function postEdit(endpoint, body) {
+  const response = await fetch('/api/home/' + H.id + '/' + endpoint, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok || data.error) throw new Error(data.error || 'The preview request failed.');
+  return data;
 }
-async function mountPatch(e, p) {
-  const n = await addNode('fd.photo', { url: `/api/home/${H.id}/render/${p.rid}/patch`, corners: p.corners, visible: false });
-  (live[e.id] ||= { patches: {} }).patches[p.sweep] = n;
+function activeEdit(e, revision) {
+  return edits.includes(e) && e.revision === revision;
 }
-function dropPatch(e, p) {
-  const n = live[e.id]?.patches?.[p.sweep]; if (n) { n.stop(); delete live[e.id].patches[p.sweep]; }
-  e.patches = e.patches.filter((x) => x !== p);
+async function renderAngle(e, angle, revision, ref = null) {
+  let fix = null;
+  const { frame, pose, rect, extra } = angle;
+  const region = e.scope === 'roll_under_sink' ? rect : paddedRect(rect, pose);
+  const norm = [region.x / pose.W, region.y / pose.H, (region.x + region.w) / pose.W, (region.y + region.h) / pose.H];
+  const task = taskText(e);
+  for (let attempt = 0; attempt < (extra ? 2 : 3); attempt++) {
+    if (!activeEdit(e, revision)) return null;
+    if (!extra) setStatus(e, attempt ? 'fixing' : 'rendering', { tries: attempt });
+    const meta = await postEdit('render', { image: frame, rect: norm, task, scope: e.scope, ref, fix, poly: angle.poly });
+    if (!activeEdit(e, revision)) return null;
+    if (!extra) setStatus(e, 'checking');
+    const q = await postEdit('verify', { rid: meta.id, task, scope: e.scope, ref });
+    if (!extra && activeEdit(e, revision)) { e.score = q.score; e.review = q; }
+    if (q.ok === true && Number(q.score) >= 7) {
+      return { sweep: pose.sweep, rid: meta.id, corners: patchCorners(meta.rect, pose, e.world?.center),
+        pose: { mode: pose.mode, sweep: pose.sweep, position: pose.position }, rot: pose.rotation, rectN: meta.rect, extra: !!extra };
+    }
+    fix = [q.fix, ...(q.issues || [])].filter(Boolean).join('. ');
+    if (!fix) break;
+  }
+  return null;
+}
+async function mountPatch(e, p, revision) {
+  const n = await addNode('fd.photo', { url: '/api/home/' + H.id + '/render/' + p.rid + '/patch', corners: p.corners, visible: false });
+  if (!activeEdit(e, revision)) { n.stop(); return false; }
+  const nodes = (live[e.id] ||= { patches: {} }).patches;
+  nodes[p.sweep]?.stop();
+  nodes[p.sweep] = n;
+  return true;
+}
+function clearPatches(e) {
+  Object.values(live[e.id]?.patches || {}).forEach((n) => n.stop());
+  delete live[e.id];
+  e.patches = [];
+}
+async function renderNearby(e, angles, revision, ref) {
+  const candidates = await angles;
+  if (!activeEdit(e, revision) || !candidates.length) return;
+  const card = jobCard({ id: e.id + '-angles', title: e.title, step: 'Preparing nearby views', pct: 70, busy: true });
+  try {
+    for (const angle of candidates) {
+    if (!activeEdit(e, revision)) return;
+      try {
+        if (e.patches.some((p) => p.sweep === angle.pose.sweep)) continue;
+        const p = await renderAngle(e, angle, revision, ref);
+        if (p && await mountPatch(e, p, revision)) { e.patches.push(p); save(); refreshVisibility(); }
+      } catch (err) { console.warn('Nearby preview rejected:', err); }
+    }
+  } finally { card.remove(); }
 }
 
 /* ================= processing window ================= */
@@ -347,91 +613,139 @@ function annotate(sel) {      // frozen frame with the user's loose outline draw
       }
       res(c.toDataURL('image/jpeg', 0.88));
     };
+    img.onerror = () => res(null);
     img.src = sel.frame;
   });
 }
-const STOP = new Set(['the', 'a', 'an', 'this', 'that', 'it', 'with', 'and', 'to', 'make', 'into', 'add', 'replace', 'remove', 'here', 'of', 'for', 'in', 'on', 'please', 'accessible', 'needs']);
-const words = (t) => new Set(String(t).toLowerCase().match(/[a-z]+/g)?.filter((w) => w.length > 2 && !STOP.has(w)) || []);
-function similarEdit(sel, instruction) {
-  const want = words(instruction);
-  return edits.find((e) => e.status !== 'failed' && e.on !== false && e.roomId && e.roomId === sel.roomId &&
-    ((e.world && sel.world && !sel.whole && dist(e.world.center, sel.world.center) < 1.2) || [...words(e.title + ' ' + (e.instruction || ''))].filter((w) => want.has(w)).length >= 2));
-}
-function ask(html, buttons, loc = null) {   // a question in the chat with button answers
-  return new Promise((res) => {
-    const el = bubble(`${html}<div class="mt-2 flex flex-wrap gap-2">${buttons.map(([k, l], i) => `<button data-k="${k}" class="text-sm font-semibold rounded-lg px-3 py-1.5 ${i ? 'border hover:bg-slate-50' : 'bg-brand-600 text-white hover:bg-brand-700'}">${l}</button>`).join('')}</div>`, 'ai', loc);
-    el.querySelectorAll('[data-k]').forEach((b) => b.onclick = () => { el.querySelectorAll('button').forEach((x) => x.disabled = true); b.classList.add('ring-2', 'ring-brand-300'); res(b.dataset.k); });
+let tourDecision = null;
+let draftReply = null;
+let renovationPreference = 'Prioritize small installations and reversible changes. Ask before structural work.';
+function ask(html, buttons, loc = null) {
+  return new Promise((resolve) => {
+    tourDecision?.('stop');
+    const pane = $('#guide-task');
+    const el = bubble(html + '<div class="decision-buttons">' + buttons.map(([key, label], i) =>
+      '<button type="button" data-k="' + key + '" class="' + (i ? 'sandra-secondary' : 'sandra-primary') + '">' + label + '</button>').join('') + '</div>', 'ai', loc);
+    if (pane) pane.replaceChildren(el);
+    const finish = (key) => {
+      if (tourDecision === finish) tourDecision = null;
+      draftReply = null;
+      el.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+      el.querySelector('.decision-buttons')?.remove();
+      if (pane?.contains(el)) $('#chat').appendChild(el);
+      resolve(key);
+    };
+    tourDecision = finish;
+    el.querySelectorAll('[data-k]').forEach((b) => { b.onclick = () => finish(b.dataset.k); });
   });
 }
 function newEdit(sel, fields) {
-  const e = { id: 'e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), title: 'Working on it', action: 'replace', item: sel.item || '',
-    option: null, options: [], custom: '', world: sel.world, cost: 0, patches: [], on: true, room: sel.roomLabel || '', roomId: sel.roomId || null,
-    status: 'understanding', crop: sel.crop, tries: 0, ...fields };
+  const e = { id: 'e' + crypto.randomUUID(), title: 'Finding the fixture', action: 'replace', item: sel.item || '',
+    option: null, options: [], custom: '', world: sel.world, cost: 0, patches: [], on: true, room: sel.roomLabel || '',
+    roomId: sel.roomId || null, status: 'understanding', crop: sel.crop, tries: 0, ...fields };
   selFor.set(e.id, sel); edits.push(e); save(); renderPlan(); showJob(e);
   return e;
 }
-function setStatus(e, s, extra = {}) { Object.assign(e, extra, { status: s }); save(); renderPlan(); showJob(e); }
-
-// Run a change. `finding` (from the guided tour) skips the locate step.
-async function command(sel, instruction, label, finding = null) {
+function setStatus(e, s, extra = {}) {
+  Object.assign(e, extra, { status: s }); save(); renderPlan(); showJob(e);
+}
+function editScope(f, instruction) {
+  const sink = /\b(sink|vanity|basin)\b/i.test([f.item, f.title, instruction].join(' '));
+  const clearance = /roll[- ]under|knee|toe clearance|pull under|(?:sink|vanity).{0,32}wheelchair|wheelchair.{0,30}(?:sink|vanity)/i.test([f.title, instruction].join(' '));
+  return f.scope === 'roll_under_sink' || (sink && clearance) ? 'roll_under_sink' : 'general';
+}
+function editTarget(sel, f, instruction, objects = []) {
+  const scope = editScope(f, instruction);
+  const target = isObjectRect(f.box_2d, sel.pose);
+  if (!target) return null;
+  const rect = scope === 'roll_under_sink' ? isObjectRect(f.edit_box_2d, sel.pose) : target;
+  const renderRect = covers(target, rect, 0.9) ? rect : null;
+  if (!renderRect && scope !== 'roll_under_sink') return null;
+  if (!sel.whole && !covers(paddedRect(target, sel.pose, 0.12), sel.rect, 0.12) && !covers(sel.rect, target, 0.12)) return null;
+  const partWorld = rect && worldFromRect(rect, sel.hits || [], sel.pose);
+  const objectWorld = worldFromRect(target, sel.hits || [], sel.pose) || sel.world || partWorld;
+  const fixture = fixtureForFinding(f, sel.pose, sel.roomId, partWorld || objectWorld, objects, scope);
+  const kind = fixture?.kind || fixtureKind(f.kind || f.item, scope);
+  const intent = editIntent(kind, f.title, scope);
+  const clearCabinet = scope === 'roll_under_sink' && (f.clear_cabinet === true ||
+    /(?:no|remove|without|does not need|do not need|don.t need|just).{0,50}(?:cabin\w+|counter)|(?:cabin\w+).{0,30}(?:all gone|remove|unneeded)/i.test(instruction));
+  return { scope, clearCabinet, kind, intent, objectId: fixture?.id, roomId: sel.roomId,
+    world: objectWorld, source: { ...sel, targetRect: target, rect: renderRect, poly: editPolygon(f, sel.pose, renderRect) } };
+}
+async function planSelection(sel, instruction) {
+  const [objects = []] = await identifyViews([{ image: sel.frame, pose: sel.pose, hits: sel.hits, roomId: sel.roomId }]).catch(() => []);
+  const image = await annotate(sel);
+  if (!image) throw new Error('I could not read that frame. Please select the item again.');
+  const plan = await postEdit('agent/plan', {
+    views: [{ image, room: sel.roomLabel }], needs: NEEDS, persona: PERSONA, instruction, outlined: !sel.whole,
+    existing: stateForAgent(sel.roomId), declined: [], inventory: [objects], preferences: renovationPreference,
+  });
+  return { finding: (plan.findings || [])[0], objects };
+}
+async function command(sel, instruction, label, finding = null, objects = []) {
   hideMenu(); clearOutline(sel);
   selections = selections.filter((x) => x !== sel); renderSelChips();
-  const dup = similarEdit(sel, instruction);
-  if (dup) {
-    const k = await ask(`You already have <b>${esc(dup.title)}</b> here${dup.option ? ` (${esc(dup.option.name)}, ${money(dup.cost)})` : ''}. What would you like?`,
-      [['replace', 'Replace it with this'], ['keep', 'Keep what I have'], ['both', 'Add both']]);
-    if (k === 'keep') { flyTo(dup); return dup; }
-    if (k === 'replace') removeEdit(dup.id, true);
-  }
   const e = newEdit(sel, { title: label || instruction, instruction });
   try {
-    let f = finding;
-    if (!f) {
-      const image = await annotate(sel);
-      const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ views: [{ image, room: sel.roomLabel }], needs: NEEDS, persona: PERSONA, instruction, outlined: !sel.whole,
-          existing: stateForAgent().filter((x) => x.change !== e.title), declined: [...declined] }) }).then((r) => r.json());
-      if (plan.error) throw new Error(plan.error);
-      f = (plan.findings || [])[0];
-      if (!f) throw new Error("I couldn't find what you meant in that view. Try circling it again.");
+    if (!finding) ({ finding, objects } = await planSelection(sel, instruction));
+    if (!finding) throw new Error('I could not identify that change in this view.');
+    const target = editTarget(sel, finding, instruction, objects);
+    if (!target) throw new Error('I could not confirm the target in your selection. Try circling the fixture again.');
+    const { source, ...identity } = target;
+    const duplicate = edits.find((planned) => matchesEdit(target, planned));
+    if (duplicate) {
+      if (finding.guided && !finding.revised) {
+        removeEdit(e.id, true);
+        return duplicate;
+      }
+      const k = await ask('This fixture already has <b>' + esc(duplicate.title) +
+        '</b> in your plan. Apply this revision?', [['replace', 'Apply revision'], ['keep', 'Keep current']]);
+      if (k !== 'replace') { removeEdit(e.id, true); return duplicate; }
     }
-    // the agent's box around the whole object becomes the edit area
-    if (f.box_2d) {
-      const b = f.box_2d, W = sel.pose.W, Hh = sel.pose.H, m = 0.04;
-      const x0 = Math.max(0, (b[1] / 1000 - m) * W), y0 = Math.max(0, (b[0] / 1000 - m) * Hh), x1 = Math.min(W, (b[3] / 1000 + m) * W), y1 = Math.min(Hh, (b[2] / 1000 + m) * Hh);
-      if (x1 - x0 > 30 && y1 - y0 > 30) { sel.rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }; sel.poly = null; }
-    }
-    const opts = f.options || [], opt = opts[Math.min(1, opts.length - 1)] || null;
-    setStatus(e, 'designing', { title: f.title || e.title, action: f.action || 'replace', item: f.item || '', options: opts, option: opt, cost: opt?.total || 0,
-      custom: !finding && !/accessible for my needs/.test(instruction) && /replace|add|install|put|make|turn|convert/i.test(instruction) ? instruction : '' });
-    if (f.advice) bubble(`<div class="text-sm"><b>${esc(e.title)}</b>${opt ? ` · ${esc(opt.name)} · ${money(opt.total)}` : ''}<div class="text-slate-600 mt-0.5">${f.fits_needs === false ? '⚠️ ' : ''}${esc(f.advice)}</div></div>`);
-    await renderAndReview(e, sel);
+    const options = finding.options || [], option = options[Math.min(1, options.length - 1)] || null;
+    setStatus(e, 'designing', { ...identity, title: finding.title || e.title, action: finding.action || 'replace',
+      item: finding.item || '', options, option, cost: option?.total || 0,
+      custom: finding.guided && !finding.revised ? '' : instruction });
+    await renderAndReview(e, source);
+    if (duplicate && e.status === 'ready') removeEdit(duplicate.id, true);
   } catch (err) {
-    setStatus(e, 'failed', { error: err.message });
+    if (edits.includes(e)) setStatus(e, 'failed', { error: err.message });
   }
   return e;
 }
+
 async function renderAndReview(e, sel) {
-  const r = { x0: sel.rect.x, y0: sel.rect.y, x1: sel.rect.x + sel.rect.w, y1: sel.rect.y + sel.rect.h };
-  let fix = null;
-  for (e.tries = 0; e.tries < 3; e.tries++) {
-    setStatus(e, e.tries ? 'fixing' : 'rendering');
-    for (const p of [...e.patches]) dropPatch(e, p);
-    const meta = await renderPatch(e, r, sel.pose, sel.frame, sel.poly, fix);
-    if (!e.ref) e.ref = meta.id;
-    setStatus(e, 'checking');
-    const q = await fetch(`/api/home/${H.id}/verify`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rid: meta.id, task: taskText(e) }) }).then((x) => x.json()).catch(() => ({ ok: true }));
-    e.score = q.score; e.review = q;
-    if (q.ok !== false) break;
-    fix = [q.fix, ...(q.issues || [])].filter(Boolean).join('; ');
-    e.ref = null;
+  const revision = e.revision = (e.revision || 0) + 1;
+  const angles = queueNearbyCapture(e, sel.pose, revision)
+    .then((views) => locateNearby(e, sel, views, revision))
+    .catch((err) => { console.warn('Could not locate nearby views:', err); return []; });
+  let source = sel;
+  let p = sel.rect ? await renderAngle(e, sel, revision) : null;
+  if (!p && e.scope === 'roll_under_sink' && activeEdit(e, revision) && e.review?.reviewer !== 'unavailable') {
+    setStatus(e, 'designing');
+    for (const angle of await angles) {
+      p = await renderAngle(e, { ...angle, extra: false }, revision);
+      if (p || !activeEdit(e, revision)) { source = angle; break; }
+    }
   }
-  setStatus(e, 'ready');
+  if (!activeEdit(e, revision)) return;
+  if (!p) throw new Error(e.review?.reviewer === 'unavailable' ? 'The preview could not be verified. Try again.' :
+    (e.review?.issues || []).join('. ') || 'I could not confirm a clear view of the cabinet. Try circling it from inside the room.');
+  if (!await mountPatch(e, p, revision)) return;
+  const mounted = live[e.id].patches;
+  for (const sweep of Object.keys(mounted)) {
+    if (sweep === p.sweep) continue;
+    mounted[sweep].stop();
+    delete mounted[sweep];
+  }
+  e.patches = [p];
+  const { pose, rect, targetRect, poly } = source;
+  setStatus(e, 'ready', { source: { rid: p.rid, pose, rect, targetRect, poly } });
   refreshVisibility();
-  const p = e.patches[0];
-  if (p && !agentBusy) say(`✅ <b>${esc(e.title)}</b> is ready${e.option ? ` · ${esc(e.option.name)} · ${money(e.cost)}` : ''}.`, { sweep: p.sweep, rot: p.rot, rect: p.rectN, label: e.title });
-  if (e.review && e.review.ok === false) bubble(`<div class="text-sm">I rendered <b>${esc(e.title)}</b>, but the quality check still flagged: ${esc((e.review.issues || []).join('; '))}. Swap the product in <b>Changes</b> to try another look.</div>`);
+  if (!agentBusy) say(`✅ <b>${esc(e.title)}</b> is ready${e.option ? ` · ${esc(e.option.name)} · ${money(e.cost)}` : ''}.`, { sweep: p.sweep, rot: p.rot, rect: p.rectN, label: e.title });
+  coverageEager.add(e.id);
+  renderNearby(e, angles.then((views) => views.filter((angle) => angle.pose.sweep !== p.sweep)), revision, p.rid)
+    .finally(() => { coverageEager.delete(e.id); scheduleCoverage(); });
 }
 
 /* ================= selection: draw / box, frozen view, action menu ================= */
@@ -497,7 +811,8 @@ overlay.addEventListener('pointerup', async () => {
   } else r = { x: Math.min(d.x0, d.x1 ?? d.x0), y: Math.min(d.y0, d.y1 ?? d.y0), w: Math.abs((d.x1 ?? d.x0) - d.x0), h: Math.abs((d.y1 ?? d.y0) - d.y0) };
   if (r.w < 14 || r.h < 14) { r = { x: d.x0 - 80, y: d.y0 - 80, w: 160, h: 160 }; poly = null; }
   if (!d.add) clearSelections();
-  await makeSelection(r, poly);
+  try { await makeSelection(r, poly); }
+  catch (err) { hint(esc(err.message), 5000); }
 });
 function cropOf(img, r, W, max = 640) {
   const k = img.naturalWidth / W, c = document.createElement('canvas');
@@ -507,12 +822,32 @@ function cropOf(img, r, W, max = 640) {
   return c.toDataURL('image/jpeg', 0.88);
 }
 async function makeSelection(r, poly = null, opts = {}) {
+  if (!poseCache || poseCache.mode !== 'mode.inside' || stationedSweep !== poseCache.sweep || capturingOriginal) {
+    throw new Error('Wait until the tour stops, then select the item again.');
+  }
   const pose = snapPose();
+  const room = currentRoom();
   const outline = opts.silent ? null : screenOutline(r, poly);
-  const [frame, world] = await Promise.all([grabFrame(), worldFromRect(r)]);
+  let frame, hits;
+  capturingOriginal = true;
+  refreshVisibility();
+  try {
+    [frame, hits] = await Promise.all([soon(grabFrame(), 8000), soon(sampleSelection(r, pose), 8000)]);
+    if (!frame || stationedSweep !== pose.sweep || !sameFrame(pose, snapPose())) {
+      throw new Error('The camera moved during capture. Circle the item again once it stops.');
+    }
+  } catch (err) {
+    outline?.remove();
+    throw err;
+  } finally {
+    capturingOriginal = false;
+    refreshVisibility();
+  }
+  hits ||= [];
+  const world = worldFromRect(r, hits, pose);
   const img = new Image(); img.src = frame; await img.decode();
-  const sel = { id: 's' + Date.now(), rect: r, poly, frame, pose, world, box: outline, crop: cropOf(img, r, pose.W), whole: !!opts.whole,
-    item: opts.item || '', label: opts.label || 'Your selection', roomLabel: currentRoom()?.label || '', roomId: currentRoom()?.id || null };
+  const sel = { id: 's' + Date.now(), rect: r, poly, frame, pose, world, hits, box: outline, crop: cropOf(img, r, pose.W), whole: !!opts.whole,
+    item: opts.item || '', label: opts.label || 'Your selection', roomLabel: room?.label || '', roomId: room?.id || null };
   if (!opts.silent) { selections.push(sel); renderSelChips(); showMenu(sel); }
   return sel;
 }
@@ -586,21 +921,28 @@ function bubble(html, who = 'ai', loc = null) {
 let unread = 0;
 const say = (html, loc) => bubble(html, 'ai', loc);
 const thinking = (t = 'Thinking') => bubble(`<span class="dots text-slate-500">${t}<span>.</span><span>.</span><span>.</span></span>`);
-const CHANGE_RE = /(make|turn|change|replace|remove|add|convert|swap|put|install|get rid|widen|lower|raise|build|design|walk-?in|ramp|grab bar|stairlift|seat|door|shower|accessible)/i;
+const CHANGE_RE = /\b(make|turn|change|replace|remove|add|convert|swap|install|get rid|widen|lower|raise|build)\b|\bnot wheelchair friendly\b/i;
 $('#chat-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const msg = $('#chat-input').value.trim(); if (!msg) return;
-  $('#chat-input').value = ''; stopAgent();
+  $('#chat-input').value = '';
   bubble(esc(msg), 'user'); chatHistory.push({ role: 'user', content: msg });
+  if (draftReply) { draftReply(msg); return; }
   if (selections.length) { for (const s of [...selections]) command(s, msg, msg); return; }
-  if (CHANGE_RE.test(msg) && sdk) {     // no selection: the agent looks at your current view to find what you mean
-    const sel = await makeSelection({ x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, null, { silent: true, whole: true });
-    command(sel, msg, msg); return;
+  if (CHANGE_RE.test(msg) && !OBJECTION.test(msg) && sdk) {
+    try {
+      const sel = await makeSelection({ x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, null, { silent: true, whole: true });
+      command(sel, msg, msg);
+    } catch (err) { bubble(esc(err.message)); }
+    return;
   }
   const t = thinking();
-  const res = await fetch(`/api/home/${H.id}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: msg, history: chatHistory, edits: edits.map((e) => `${e.title} (${money(e.cost)})`) }) }).then((r) => r.json());
-  t.remove(); bubble(esc(res.reply || '').replace(/\n/g, '<br>')); chatHistory.push({ role: 'assistant', content: res.reply });
+  try {
+    const res = await postEdit('chat', { message: msg, history: chatHistory, edits: stateForAgent(currentRoom()?.id) });
+    bubble(esc(res.reply || '').replace(/\n/g, '<br>'));
+    chatHistory.push({ role: 'assistant', content: res.reply });
+  } catch { bubble('Sandra could not answer just now. Try again in a moment.'); }
+  finally { t.remove(); }
 });
 $('#chat-clear').onclick = () => { $('#chat').innerHTML = ''; chatHistory = []; };
 
@@ -609,92 +951,238 @@ const ROOM_PRIORITY = [/bath/i, /bedroom/i, /stair|hall/i, /kitchen/i, /laundry/
 function agentRooms() {
   const picks = [];
   for (const re of ROOM_PRIORITY) for (const r of roomList) if (re.test(r.label) && !picks.includes(r)) picks.push(r);
-  return picks.filter((r) => !/closet|pantry|garage/i.test(r.label)).slice(0, 4);
+  for (const room of roomList) if (!picks.includes(room)) picks.push(room);
+  return picks.filter((r) => !/closet|pantry/i.test(r.label));
 }
-function stopAgent() { if (agentBusy) agentAbort = true; }
+function setSandraState(phase, title, detail = '') {
+  $('#guide-sub').textContent = phase;
+  const task = $('#guide-task');
+  if (!task) return;
+  task.innerHTML = '<div class="sandra-task"><strong>' + esc(title) + '</strong>' +
+    (detail ? '<p>' + esc(detail) + '</p>' : '') + '</div>';
+}
+function stopAgent() {
+  if (agentBusy) {
+    agentAbort = true;
+    tourDecision?.('stop');
+  }
+}
 async function startAgent() {
-  if (agentBusy || !roomList.length) return;
-  agentBusy = true; agentAbort = false; setMode('walk'); closeDrawers();
-  try { await guidedTour(); } catch (err) { console.error(err); bubble(`<span class="text-red-600">Tour stopped: ${esc(err.message)}</span>`); }
-  finally { agentBusy = false; renderMissingViews(); }
+  if (agentBusy) return;
+  if (!roomList.length || !poseCache) { hint('Sandra is waiting for room data.', 4000); return; }
+  openGuide();
+  agentBusy = true;
+  agentAbort = false;
+  document.body.classList.add('sandra-guiding');
+  $('#guide-title-run').disabled = true;
+  setMode('walk');
+  closeDrawers();
+  try { await guidedTour(); }
+  catch (err) { console.error(err); setSandraState('Ready', 'Tour paused', err.message); }
+  finally {
+    agentBusy = false;
+    document.body.classList.remove('sandra-guiding');
+    $('#guide-title-run').disabled = false;
+    setRoverState('idle');
+    scheduleCoverage();
+  }
 }
 $('#agent-run').onclick = startAgent;
-async function guidedTour() {
-  for (let i = 0; i < 50 && !poseCache; i++) await sleep(100);
-  const rooms = agentRooms();
-  say(`<b>Let's walk through it together.</b> I'll take you to ${rooms.map((r) => esc(r.label)).join(', ')}, point out what gets in the way${NEEDS.length ? ' for your needs' : ''}, and show each fix in place. You decide what to keep.${BUDGET ? ` Budget: ${money(BUDGET)}.` : ''}`);
-  let accepted = 0;
-  for (const room of rooms) {
-    if (agentAbort) break;
-    const step = thinking(`Walking to ${room.label}`);
-    await walkTo(centerSweep(room).id);
-    await sleep(500);
-    // look around smoothly while capturing what we see
-    const views = [];
-    const start = { ...poseCache.rotation };
+$('#guide-title-run').onclick = startAgent;
+$('#guide-stop').onclick = stopAgent;
+
+async function surveyRoom(room) {
+  const start = poseCache.rotation.y, views = [];
+  capturingOriginal = true;
+  refreshVisibility();
+  try {
     for (let k = 0; k < 4 && !agentAbort; k++) {
-      if (k) await lookAt({ x: -15, y: start.y + k * 90 }, 110); else await lookAt({ x: -15, y: start.y }, 110);
-      // same aspect as the tour on screen, so the agent's box coordinates map straight onto the view
-      views.push({ image: await soon(sdk.Renderer.takeScreenShot({ width: 960, height: Math.round(960 * iframe.clientHeight / iframe.clientWidth) }, { mattertags: false, sweeps: false }), 8000), room: room.label, rot: { ...poseCache.rotation } });
+      await lookAt({ x: -17, y: start + k * 90 }, 125);
+      const pose = snapPose();
+      const area = { x: 0, y: 0, w: pose.W, h: pose.H };
+      const [image, hits] = await Promise.all([
+        soon(grabFrame(), 8000),
+        soon(sampleSelection(area, pose), 7500),
+      ]);
+      if (image && sameFrame(pose, snapPose())) views.push({ image, pose, hits: hits || [], room: room.label, roomId: room.id });
     }
-    step.remove();
-    if (agentAbort) break;
-    const step2 = thinking(`Checking ${room.label}`);
-    const plan = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ views, needs: NEEDS, persona: PERSONA, existing: stateForAgent(), declined: [...declined] }) }).then((r) => r.json()).catch(() => ({}));
-    step2.remove();
-    if (agentAbort) break;
-    const f = (plan.findings || []).find((x) => x.fits_needs !== false && !declined.has(keyOf(room.label, x.title))) || null;
-    if (!f) { say(`<b>${esc(room.label)}</b>: nothing here gets in your way. 👍`); continue; }
-    // Turn to it, then re-locate it in exactly what's on screen (the model's view numbering isn't reliable).
-    const order = [f.view, f.view - 1, ...views.keys()].filter((v, i, arr) => v >= 0 && v < views.length && arr.indexOf(v) === i);
-    let b = null;
-    for (const v of order) {
-      await lookAt(views[v].rot, 90); await sleep(250);
-      const shot = await soon(sdk.Renderer.takeScreenShot({ width: 960, height: Math.round(960 * iframe.clientHeight / iframe.clientWidth) }, { mattertags: false, sweeps: false }), 8000);
-      const re = await fetch(`/api/home/${H.id}/agent/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ views: [{ image: shot, room: room.label }], needs: NEEDS, instruction: `Locate: ${f.item} (${f.title}). Only return it if it is clearly visible in this photo.` }) }).then((r) => r.json()).catch(() => ({}));
-      const g = (re.findings || [])[0];
-      if (g?.box_2d) { b = g.box_2d; break; }   // the locate prompt names the exact item, so any box it returns is it
-      if (agentAbort) break;
+  } finally { capturingOriginal = false; refreshVisibility(); }
+  return views;
+}
+
+function guidedLocation(f, views, inventory) {
+  let i = f.view;
+  if (f.object_id) {
+    const indexed = inventory.findIndex((items) => items.some((item) => item.object_id === f.object_id));
+    if (!inventory[i]?.some((item) => item.object_id === f.object_id) && indexed !== -1) i = indexed;
+  }
+  const view = views[i];
+  if (!view) return null;
+  const rect = isObjectRect(f.box_2d, view.pose);
+  if (!rect) return null;
+  return { frame: view.image, pose: view.pose, hits: view.hits, rect, whole: true, poly: null,
+    roomLabel: view.room, roomId: view.roomId, id: 's' + Date.now(), objects: inventory[i] || [] };
+}
+function normalizedGuideRect(rect, pose) {
+  return [rect.x / pose.W, rect.y / pose.H, (rect.x + rect.w) / pose.W, (rect.y + rect.h) / pose.H];
+}
+function structural(f) {
+  return f.effort === 'structural' || /widen(?:ing)? (?:the |this )?(?:door|entrance|opening|hall)|remove (?:a |the )?wall|new doorway|move (?:the )?plumbing/i.test(f.title || '');
+}
+function decisionText(prompt, skipLabel = 'Next room') {
+  const answer = ask(prompt, [['skip', skipLabel], ['stop', 'End tour']]);
+  draftReply = (text) => tourDecision?.(text);
+  $('#chat-input').focus();
+  return answer;
+}
+const OBJECTION = /too (?:expensive|much|complicated|invasive)|costs? too|too big|over budget|cheaper|simpler/i;
+function statedCap(text) {
+  const match = text.match(/(?:under|up to|at most|max(?:imum)?|budget of)\s*\$?\s*([\d,]+)(?:\s*(k)\b)?|^\s*\$\s*([\d,]+)(?:\s*(k)\b)?\s*$/i);
+  if (!match) return null;
+  return Number((match[1] || match[3]).replaceAll(',', '')) * (match[2] || match[4] ? 1000 : 1);
+}
+async function reviewSuggestion(f, sel, loc) {
+  let finding = f, instruction = f.title, revised = false;
+  while (!agentAbort) {
+    $('#guide-sub').textContent = 'Your decision';
+    const opt = (finding.options || [])[Math.min(1, (finding.options || []).length - 1)];
+    const chosen = await (async () => {
+      const answer = ask('<div class="sandra-room-label">' + esc(sel.roomLabel) + '</div><strong>' + esc(finding.title) +
+        '</strong><p>' + esc(finding.issue || finding.reason || '') + '</p>' +
+        (opt ? '<p class="sandra-price">About ' + money(opt.total) + ' installed</p>' : '') +
+        (structural(finding) ? '<p>This involves structural work. Confirm the scope before previewing.</p>' : ''),
+        [['yes', 'Preview change'], ['adjust', 'Refine with Sandra'], ['skip', 'Skip'], ['stop', 'End tour']], loc);
+      draftReply = (text) => tourDecision?.({ text });
+      return answer;
+    })();
+    if (chosen === 'yes') return { finding, instruction, revised };
+    if (chosen === 'skip' || chosen === 'stop' || agentAbort) return chosen;
+    let text = chosen?.text;
+    if (!text || OBJECTION.test(text)) {
+      const question = text && /expensive|budget|cost/i.test(text)
+        ? 'What should the installed cost stay under? I can also find a simpler hardware change.'
+        : 'What should I keep, change, or leave alone? For example, keep the doorway and install a lever handle.';
+      const answer = await decisionText(question, 'Skip this change');
+      if (answer === 'skip' || answer === 'stop' || agentAbort) return answer;
+      text = [text, answer].filter(Boolean).join('. ');
     }
-    if (agentAbort) break;
-    if (!b) { say(`<b>${esc(room.label)}</b>: I noticed ${esc(f.item)} but couldn't line it up on screen. You can circle it yourself with <b>✎ Change something</b>.`); continue; }
-    const loc = { sweep: poseCache.sweep, rot: { ...poseCache.rotation }, rect: [b[1] / 1000, b[0] / 1000, b[3] / 1000, b[2] / 1000], label: f.item };
-    spotlight(loc);
-    const opt = (f.options || [])[Math.min(1, (f.options || []).length - 1)];
-    const k = await ask(`<div class="text-[11px] font-semibold text-slate-500 uppercase">${esc(room.label)}</div>
-      <div class="font-semibold">${esc(f.item)}: ${esc(f.issue)}</div>
-      <div class="text-sm text-slate-600 mt-0.5">Fix: <b>${esc(f.title)}</b>${opt ? `, e.g. ${esc(opt.name)}, about ${money(opt.total)} (item ${money(opt.material)} + labor ${money(opt.labor)})` : ''}.</div>
-      ${f.advice ? `<div class="text-sm text-slate-500 mt-0.5">${esc(f.advice)}</div>` : ''}`,
-      [['yes', 'Show me this fix'], ['skip', 'Skip'], ['stop', 'End tour']], loc);
-    if (k === 'stop' || agentAbort) { agentAbort = true; clearSpot(); break; }
-    if (k === 'skip') { declined.add(keyOf(room.label, f.title)); saveDeclined(); clearSpot(); continue; }
-    // stay in this room until the fix is ready, then show it right here
-    await walkTo(loc.sweep); await lookAt(loc.rot, 90); await sleep(300);
-    const W = iframe.clientWidth, Hh = iframe.clientHeight;
-    const rect = { x: loc.rect[0] * W, y: loc.rect[1] * Hh, w: (loc.rect[2] - loc.rect[0]) * W, h: (loc.rect[3] - loc.rect[1]) * Hh };
-    clearSpot();
-    const sel = await makeSelection(rect, null, { silent: true, item: f.item });
-    accepted++;
-    say(`Working on <b>${esc(f.title)}</b>. I'll stay here and show you when it's ready (about a minute).`);
-    const e = await command(sel, f.title, f.title, { ...f, box_2d: null });
-    if (agentAbort) break;
-    if (e?.status === 'ready') {
-      await walkTo(loc.sweep); await lookAt(loc.rot, 90); setView('after');
-      const k2 = await ask(`<b>Here it is: ${esc(e.title)}</b>${e.option ? ` (${esc(e.option.name)}, ${money(e.cost)})` : ''}. Hold <b>B</b> to compare with today.`,
-        [['next', 'Keep it, next room'], ['undo', 'Undo it'], ['stop', 'End tour']]);
-      if (k2 === 'undo') { removeEdit(e.id); accepted--; }
-      if (k2 === 'stop') { agentAbort = true; break; }
-    } else if (e) {
-      const k2 = await ask(`I couldn't finish <b>${esc(e.title)}</b> (${esc(e.error || 'unknown error')}).`, [['next', 'Next room'], ['stop', 'End tour']]);
-      if (k2 === 'stop') { agentAbort = true; break; }
+    renovationPreference = text.slice(0, 400);
+    setSandraState('Revising', 'Updating the proposal', text);
+    const revision = await planSelection(sel, 'Revise this proposal: ' + finding.title + '. Buyer wants: ' + text +
+      '. Keep all unrelated parts untouched. If a simpler part is requested, target only that part. Find it in this original photo.');
+    if (!revision.finding?.box_2d) {
+      const answer = await decisionText('I could not see that part clearly. Can you describe which part to target?', 'Skip this change');
+      if (answer === 'skip' || answer === 'stop' || agentAbort) return answer;
+      text += '. ' + answer;
+      const retry = await planSelection(sel, text);
+      if (!retry.finding?.box_2d) return 'skip';
+      revision.finding = retry.finding;
+    }
+    finding = revision.finding;
+    const preserve = /\b(?:only|just)\s+(?:a\s+)?(?:lever|handle|knob)|\b(?:keep|leave)\b.{0,25}\b(?:doorway|opening|walls?)\b|(?:no|without|don.t)\s+widen/i.test(text);
+    if (preserve && structural(finding)) {
+      say('That revision still included structural work. I’ll keep the doorway as it is.');
+      return 'skip';
+    }
+    const cap = statedCap(text);
+    if (cap) {
+      const options = (finding.options || []).filter((o) => o.total <= cap);
+      if (!options.length) {
+        const answer = await decisionText('I don’t have an estimated installation under ' + money(cap) +
+          '. Which part should we keep, or would you like to skip it?', 'Skip this change');
+        if (answer === 'skip' || answer === 'stop' || agentAbort) return answer;
+        const retry = await planSelection(sel, text + '. Buyer clarified: ' + answer);
+        if (!retry.finding) return 'skip';
+        finding = { ...retry.finding, options: (retry.finding.options || []).filter((o) => o.total <= cap) };
+        if (!finding.options.length) { say('I couldn’t find a verified-cost option within that limit.'); return 'skip'; }
+      } else finding = { ...finding, options };
+    }
+    instruction = text;
+    revised = true;
+    const next = isObjectRect(finding.box_2d, sel.pose);
+    if (next) {
+      loc.rect = normalizedGuideRect(next, sel.pose);
+      loc.label = finding.item;
+      if (poseCache.sweep === loc.sweep) spotlight(loc);
+      setRoverState('inspect', currentRoom(), null, next);
     }
   }
+  return 'stop';
+}
+
+async function guidedTour() {
+  const rooms = agentRooms();
+  say('I’ll check ' + rooms.map((r) => esc(r.label)).join(', ') + '. You can refine or skip any suggestion.');
+  let accepted = 0;
+  for (let i = 0; i < rooms.length && !agentAbort; i++) {
+    const room = rooms[i];
+    setSandraState('Room ' + (i + 1) + ' of ' + rooms.length, 'Walk with me to ' + room.label);
+    const target = centerSweep(room);
+    await walkTo(target.id);
+    if (agentAbort) break;
+    await sleep(320);
+    setSandraState('Reading the room', room.label, 'I’m checking fixtures and access from the original scan.');
+    setRoverState('scan', room);
+    const views = await surveyRoom(room);
+    if (!views.length || agentAbort) continue;
+    const inventory = await identifyViews(views).catch(() => views.map(() => []));
+    if (agentAbort) break;
+    const plan = await postEdit('agent/plan', {
+      views: views.map(({ image, room }) => ({ image, room })), inventory, needs: NEEDS, persona: PERSONA,
+      existing: stateForAgent(room.id), declined: [...declined], preferences: renovationPreference,
+    }).catch(() => null);
+    if (!plan) { say('I couldn’t finish checking ' + esc(room.label) + '.'); continue; }
+    let suggested = 0;
+    for (const f of (plan.findings || [])) {
+      if (agentAbort || suggested >= 2) break;
+      if (f.fits_needs === false || declined.has(keyOf(room.label, f.title))) continue;
+      const sel = guidedLocation(f, views, inventory);
+      if (!sel) continue;
+      const draft = editTarget(sel, f, f.title, sel.objects);
+      if (!draft) continue;
+      const existing = edits.find((e) => matchesEdit(draft, e));
+      if (existing) {
+        const p = existing.patches[0];
+        say(esc(existing.title) + ' is already in your plan for ' + esc(room.label) + '.',
+          p && { sweep: p.sweep, rot: p.rot, rect: p.rectN, label: existing.title });
+        continue;
+      }
+      const loc = { sweep: sel.pose.sweep, rot: sel.pose.rotation, rect: normalizedGuideRect(sel.rect, sel.pose), label: f.item };
+      await lookAt(loc.rot, 90);
+      if (agentAbort) break;
+      spotlight(loc);
+      setRoverState('inspect', room, null, sel.rect);
+      if (structural(f)) {
+        say('<b>' + esc(room.label) + '</b> · Confirm the doorway or passage dimensions against your must-haves. I’ll look for simpler changes first.', loc);
+        clearSpot();
+        continue;
+      }
+      suggested++;
+      const choice = await reviewSuggestion(f, sel, loc);
+      clearSpot();
+      if (choice === 'stop' || agentAbort) { agentAbort = true; break; }
+      if (choice === 'skip') { declined.add(keyOf(room.label, f.title)); saveDeclined(); continue; }
+      setSandraState('Preparing your preview', choice.finding.title, 'Nearby angles are checked in the background.');
+      const e = await command(sel, choice.instruction, choice.finding.title, { ...choice.finding, guided: true, revised: choice.revised }, sel.objects);
+      if (agentAbort) break;
+      if (e?.status === 'ready') {
+        const preview = e.patches[0];
+        await walkTo(preview.sweep);
+        await lookAt(preview.rot, 90);
+        setView('after');
+        $('#guide-sub').textContent = 'Preview ready';
+        const decision = await ask('<strong>' + esc(e.title) + '</strong><p>' + (e.cost ? money(e.cost) + ' estimated installed. ' : '') +
+          'Compare the original or take a step to inspect the edit.</p>', [['next', 'Keep and continue'], ['undo', 'Undo'], ['stop', 'End tour']]);
+        if (decision === 'undo') removeEdit(e.id);
+        else accepted++;
+        if (decision === 'stop') { agentAbort = true; break; }
+      } else if (e) say('I couldn’t verify that preview. ' + esc(e.error || 'Try another view.'));
+    }
+    if (!suggested && !agentAbort) say(esc(room.label) + ' checked. I didn’t find another small change for your needs in the views I checked.');
+  }
   clearSpot();
-  const total = edits.filter((x) => x.on !== false && x.status === 'ready').reduce((s, x) => s + (x.cost || 0), 0);
-  say(agentAbort ? 'Tour ended. The home is yours to explore.' :
-    `<b>That's the tour.</b> ${accepted ? `${accepted} change${accepted > 1 ? 's' : ''}, ${money(total)} in total${BUDGET ? `; total cost ${money(H.price + total)} is ${H.price + total <= BUDGET ? 'within' : 'over'} your ${money(BUDGET)} budget` : ''}.` : 'No changes needed.'} Circle anything else you'd like to change.`);
+  setSandraState(agentAbort ? 'Explore' : 'Tour complete', agentAbort ? 'The home is yours to explore' : 'Review your plan',
+    accepted ? accepted + ' changes kept. Open Planned changes to see the total.' : 'Ask Sandra about a fixture or explore another room.');
 }
 
 /* ================= changes drawer, undo, compare ================= */
@@ -702,12 +1190,12 @@ function save() { try { localStorage.setItem(STORE, JSON.stringify(edits)); } ca
 async function restoreEdits() {
   try { edits = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch { edits = []; }
   edits = edits.filter((e) => e.status === 'ready' && e.patches.length);   // unfinished work can't resume after a reload
-  for (const e of edits) for (const p of e.patches) await mountPatch(e, p);
+  for (const e of edits) for (const p of e.patches) if (p.pose) await mountPatch(e, p, e.revision);
   save(); refreshVisibility(); renderPlan();
 }
 function removeEdit(id, quiet = false) {
   const e = edits.find((x) => x.id === id); if (!e) return;
-  Object.values(live[id]?.patches || {}).forEach((n) => n.stop()); delete live[id];
+  clearPatches(e);
   edits = edits.filter((x) => x.id !== id); document.getElementById('job-' + id)?.remove();
   save(); renderPlan();
   if (!quiet) hint(`Removed “${esc(e.title)}”.`, 3000);
@@ -715,11 +1203,29 @@ function removeEdit(id, quiet = false) {
 function undo() { const e = [...edits].reverse().find((x) => x.status === 'ready' || x.status === 'failed'); if (e) removeEdit(e.id); }
 $('#undo').onclick = undo;
 async function swapOption(id, i) {
-  const e = edits.find((x) => x.id === id); if (!e || !e.options[i]) return;
-  e.option = e.options[i]; e.cost = e.option.total; e.ref = null; e.custom = '';
-  const sel = selFor.get(id);
-  if (sel) renderAndReview(e, sel).catch((err) => setStatus(e, 'failed', { error: err.message }));
-  else { for (const p of [...e.patches]) dropPatch(e, p); save(); renderPlan(); hint('Walk back to it and it will re-render with the new product.', 4000); }
+  const e = edits.find((x) => x.id === id);
+  if (!e?.source || !e.options[i] || e.status !== 'ready') return;
+  const previous = { option: e.option, cost: e.cost, custom: e.custom, review: e.review, score: e.score };
+  const source = e.source;
+  e.revision++;
+  setStatus(e, 'designing', { option: e.options[i], cost: e.options[i].total, custom: '' });
+  try {
+    const response = await fetch(`/api/home/${H.id}/render/${source.rid}/before`);
+    if (!response.ok) throw new Error('The original photo is unavailable.');
+    const blob = await response.blob();
+    const frame = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+    if (edits.includes(e)) await renderAndReview(e, { ...source, frame });
+  } catch (err) {
+    if (!edits.includes(e)) return;
+    setStatus(e, 'ready', previous);
+    refreshVisibility();
+    hint(esc(err.message || 'Could not swap this option.'), 5000);
+  }
 }
 const PILL = {
   understanding: ['Thinking…', 'text-brand-700 bg-brand-50 animate-pulse'], designing: ['Pricing…', 'text-brand-700 bg-brand-50 animate-pulse'],
@@ -728,6 +1234,7 @@ const PILL = {
 };
 function renderPlan() {
   const on = edits.filter((e) => e.on !== false && e.status === 'ready');
+  $('.sandra-coverage').hidden = !on.some((e) => e.source);
   const total = on.reduce((s, e) => s + (e.cost || 0), 0), labor = on.reduce((s, e) => s + (e.option?.labor || 0), 0);
   $('#plan-count').textContent = edits.length;
   $('#plan').innerHTML = [...edits].reverse().map((e) => {
@@ -740,7 +1247,7 @@ function renderPlan() {
         <div class="flex items-center gap-1.5"><span class="text-[11px] font-semibold rounded-full px-2 py-0.5 ${pc}">${pl}</span><span class="ml-auto font-semibold text-sm">${e.cost ? money(e.cost) : ''}</span></div>
         <div class="font-medium text-sm leading-tight mt-0.5">${esc(e.title)}</div>
         <div class="text-xs text-slate-500">${esc(e.room)}${e.option ? ` · item ${money(e.option.material)} + labor ${money(e.option.labor)}` : ''}</div>
-        ${e.options?.length > 1 && e.status === 'ready' ? `<select data-swap="${e.id}" class="mt-1 max-w-full text-xs border rounded px-1 py-0.5">${e.options.map((o, i) => `<option value="${i}" ${o.name === e.option?.name ? 'selected' : ''}>${esc(o.tier)}: ${esc(o.name)} (${money(o.total)})</option>`).join('')}</select>` : ''}
+        ${e.source && e.options?.length > 1 && e.status === 'ready' ? `<select data-swap="${e.id}" class="mt-1 max-w-full text-xs border rounded px-1 py-0.5">${e.options.map((o, i) => `<option value="${i}" ${o.name === e.option?.name ? 'selected' : ''}>${esc(o.tier)}: ${esc(o.name)} (${money(o.total)})</option>`).join('')}</select>` : ''}
         <div class="mt-1 flex items-center gap-3 text-xs">
           ${e.status === 'ready' ? `<label class="flex items-center gap-1 text-slate-600"><input type="checkbox" data-on="${e.id}" ${e.on !== false ? 'checked' : ''} class="accent-brand-600">Show</label>
           <button data-go="${e.id}" class="text-brand-700 font-semibold">View</button>` : ''}
@@ -764,15 +1271,16 @@ async function flyTo(e) {
   const p = e.patches.find((x) => !x.extra) || e.patches[0];
   await soon(sdk.Sweep.moveTo(p.sweep, { transition: sdk.Sweep.Transition.FLY, transitionTime: 700 }));
   await lookAt(p.rot || poseCache.rotation);
-  hint(`<b>${esc(e.title)}</b>. Hold <b>B</b> or flip <b>Your changes</b> to compare with today.`, 5000);
+  hint(p.pose ? `<b>${esc(e.title)}</b>. Hold <b>B</b> or flip <b>Your changes</b> to compare with today.` :
+    'Circle the fixture again to rebuild this saved preview with the current renderer.', 5000);
 }
 function setView(v) {
   view = v; refreshVisibility();
+  if (v === 'after') scheduleCoverage();
   const on = v === 'after';
   $('#compare-dot').className = 'w-9 h-6 rounded-full relative transition ' + (on ? 'bg-brand-600' : 'bg-slate-300');
   $('#compare-dot').firstElementChild.className = 'absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition ' + (on ? 'right-0.5' : 'left-0.5');
   $('#compare-label').textContent = on ? 'Your changes on' : 'Today (as listed)';
-  if (on) renderMissingViews();
 }
 $('#compare').onclick = () => setView(view === 'after' ? 'orig' : 'after');
 
@@ -814,15 +1322,11 @@ let hintTimer;
 function hint(html, ms) { const h = $('#hint'); h.innerHTML = html; h.style.opacity = 1; clearTimeout(hintTimer); if (ms) hintTimer = setTimeout(() => h.style.opacity = 0, ms); }
 
 function welcome() {
-  if (edits.length) { bubble(`Welcome back. Your ${edits.length} change${edits.length > 1 ? 's are' : ' is'} in the tour. Open <b>Changes</b> to turn them on or off.`); return; }
-  const needs = NEEDS.map((k) => info?.evidence?.[k]?.label?.toLowerCase()).filter(Boolean);
-  const el = bubble(`<div class="font-semibold">Hi! I'm your guide for this home.</div>
-    <div class="text-sm text-slate-600 mt-1">${needs.length ? `You told me you need ${needs.join(', ')}. ` : ''}I can walk you room by room and show what this home would look like with the changes you need, with real prices.</div>
-    <div class="mt-2 flex flex-wrap gap-2"><button data-go class="text-sm font-semibold bg-brand-600 text-white rounded-lg px-3 py-1.5 hover:bg-brand-700">Walk me through it</button>
-    <button data-self class="text-sm border rounded-lg px-3 py-1.5 hover:bg-slate-50">I'll explore myself</button></div>`);
-  el.querySelector('[data-go]').onclick = () => { el.querySelectorAll('button').forEach((b) => b.disabled = true); startAgent(); };
-  el.querySelector('[data-self]').onclick = () => { el.querySelectorAll('button').forEach((b) => b.disabled = true);
-    bubble('Great. Drag to look around; click the floor to move. When something should be different, click <b>✎ Change something</b>, circle it, and tell me what you want.'); };
+  setSandraState('Ready to explore', edits.length ? 'Welcome back' : 'Let’s take a look',
+    edits.length ? edits.length + ' changes in your plan. I’ll check what’s already covered as we walk.' :
+      'Start a guided tour, or ask me about a fixture in this view.');
+  setRoverState('idle');
+  scheduleCoverage();
 }
 
 (async () => {
@@ -851,5 +1355,50 @@ window.FD_CONTEXT = async () => ({
   chat: [...document.querySelectorAll('#chat > div')].slice(-30).map((d) => d.innerText.slice(0, 600)),
 });
 
-$('#guide-min').onclick = () => { document.body.classList.add('guide-min'); $('#guide').classList.add('hidden'); $('#guide-open').classList.remove('hidden'); unread = 0; $('#guide-new').textContent = ''; };
-$('#guide-open').onclick = () => { document.body.classList.remove('guide-min'); $('#guide').classList.remove('hidden'); $('#guide-open').classList.add('hidden'); $('#chat').scrollTop = 1e9; };
+$('#guide-min').onclick = () => {
+  document.body.classList.add('guide-min'); $('#guide').classList.add('hidden'); $('#guide-open').classList.remove('hidden');
+  clearSpot(); unread = 0; $('#guide-new').textContent = '';
+};
+function openGuide() {
+  document.body.classList.remove('guide-min'); $('#guide').classList.remove('hidden'); $('#guide-open').classList.add('hidden');
+  $('#chat').scrollTop = $('#chat').scrollHeight;
+}
+$('#guide-open').onclick = openGuide;
+$('#history-toggle').onclick = (event) => {
+  const hidden = $('#chat').classList.toggle('hidden');
+  event.currentTarget.setAttribute('aria-expanded', String(!hidden));
+};
+$('#guide-hop').onclick = () => setRoverState('hop');
+$('#guide-angle-retry').onclick = () => {
+  if (!coverageBusy) {
+    $('#coverage-status').textContent = 'Checking for a new preview here…';
+    prepareCurrentAngle(true).then((started) => {
+      if (started === false) $('#coverage-status').textContent = 'No new edit is visible from this spot.';
+    }).catch(() => { $('#coverage-status').textContent = 'Could not check this angle. Try again.'; });
+  }
+};
+$('#guide-index').onclick = async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const sel = await makeSelection({ x: 0, y: 0, w: iframe.clientWidth, h: iframe.clientHeight }, null, { silent: true, whole: true });
+    const [objects = []] = await identifyViews([{ pose: sel.pose, image: sel.frame, hits: sel.hits, roomId: sel.roomId }]);
+    const panel = bubble('<strong>' + esc(sel.roomLabel || 'This view') + '</strong><p>' +
+      (objects.length ? objects.length + ' identified items. Select one to see it.' : 'I could not confirm an object from this angle.') + '</p>');
+    const items = document.createElement('div');
+    items.className = 'sandra-object-list';
+    for (const obj of objects) {
+      const rect = isObjectRect(obj.box_2d, sel.pose);
+      if (!rect) continue;
+      const item = document.createElement('button');
+      item.textContent = obj.label + (obj.parent ? ' · Part' : '');
+      item.onclick = () => goTo({ sweep: sel.pose.sweep, rot: sel.pose.rotation, rect: normalizedGuideRect(rect, sel.pose), label: obj.label });
+      items.appendChild(item);
+    }
+    panel.firstElementChild.appendChild(items);
+    $('#chat').classList.remove('hidden');
+    $('#history-toggle').setAttribute('aria-expanded', 'true');
+    $('#chat').scrollTop = $('#chat').scrollHeight;
+  } catch (err) { bubble(esc(err.message || 'This angle could not be indexed.')); }
+  finally { button.disabled = false; }
+};

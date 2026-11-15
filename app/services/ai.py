@@ -179,7 +179,8 @@ def _as_obj(res, list_key):
 # ---------- task prompts ----------
 
 NEED_KEYS = ["no_stairs", "step_free_entry", "wide_doorways", "walk_in_shower", "grab_bars",
-             "first_floor_bedroom", "smooth_flooring", "garage"]
+             "first_floor_bedroom", "smooth_flooring", "garage", "lever_handles", "visual_alerts",
+             "even_lighting", "quiet_space"]
 
 OPTIONS_SPEC = """"options": exactly 3 real, buyable choices from budget to premium, each
   {"tier":"Budget"|"Standard"|"Premium","name": product-style name (generic or common brand line),
@@ -188,11 +189,23 @@ OPTIONS_SPEC = """"options": exactly 3 real, buyable choices from budget to prem
    "notes": short install note (permits, plumbing, blocking in wall, etc.)}"""
 
 
+ROLL_UNDER = (
+    "Make this exact sink roll-under by opening the cabinet below the basin for clear forward knee and toe space. "
+    "Remove doors, shelving, plinth and other obstructions in that opening, with a finished floor underneath "
+    "and protected plumbing set back out of knee space. Keep the basin, faucet, countertop, wall, height, "
+    "footprint and orientation in their original positions. Preserve adjacent cabinetry and fixtures."
+)
+
+
 def parse_query(text: str) -> dict:
     prompt = f"""Turn a home-seeker's request into search filters for an accessible-home search.
 Request: "{text}"
 Return JSON: needs: subset of {NEED_KEYS} (wheelchair -> no_stairs, step_free_entry, wide_doorways, walk_in_shower, smooth_flooring;
-elderly/aging in place -> no_stairs, first_floor_bedroom, grab_bars, walk_in_shower); max_price: number|null; min_beds: number|null;
+elderly/aging in place -> no_stairs, first_floor_bedroom, grab_bars, walk_in_shower; dexterity -> lever_handles;
+hearing access -> visual_alerts; low vision -> even_lighting; noise sensitivity -> quiet_space).
+required: subset of needs representing explicitly stated must-haves or structural constraints clearly necessary to the buyer.
+Keep unspecified preferences flexible. Do not infer wheelchair use for other accessibility needs.
+max_price: number|null; min_beds: number|null;
 city: "Houston"|"Los Angeles"|null; rent: true|false|null; persona: one sentence about the user's situation; summary: short phrase."""
     return ask(prompt)
 
@@ -217,7 +230,8 @@ At most 2 changes. Costs must be realistic for 2026. Never claim ADA compliance;
 
 
 def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, instruction: str = "",
-               outlined: bool = False, existing: list | None = None, declined: list | None = None) -> dict:
+               outlined: bool = False, existing: list | None = None, declined: list | None = None,
+               inventory: list | None = None, preferences: str = "") -> dict:
     """Agent: find what to change. With an instruction it targets the object the user means (the magenta outline,
     if present, only marks roughly where they pointed)."""
     target = ""
@@ -230,18 +244,41 @@ def agent_plan(views: list[bytes], rooms: list[str], needs: list, persona: str, 
     prompt = f"""You are an accessibility agent touring a home for a buyer. Buyer: {persona or 'not described'}; needs: {needs}.
 You get {len(views)} photos from the home's 3D tour (image i is view i; rooms: {rooms}).
 {target}
+Recognized fixtures and parts, keyed by zero-based image index: {json.dumps(inventory or [])}
+Use the corresponding object_id when one accurately matches. A door, its handle, a basin, its faucet and
+the cabinet below a basin are distinct targets. For suggestions touching several parts, choose one actionable part.
+Buyer's renovation preferences: {preferences or 'Start with small changes and avoid structural work.'}
 WHAT HAS ALREADY BEEN DONE IN THIS HOME (the photos may still show the original, but treat these as done):
 {json.dumps(existing or [])}
 Suggestions the buyer already declined (never suggest again): {json.dumps(declined or [])}
-Be context aware: never propose something already done or declined. Also judge redundancy across the home: e.g. if one
+Avoid unsolicited duplicates. An explicit request to revise an existing change overrides a previous decision.
+Do not treat fixtures of the same type in different rooms, or separate parts of one fixture, as the same object.
+Also judge redundancy across the home: e.g. if one
 bathroom already has (or is planned to get) a roll-in shower, a second bathroom's tub is a lower priority; then set
 fits_needs false or say in "advice" that it's optional and why. Prefer the barriers that matter most for daily life.
 Find the concrete EXISTING barriers for THIS buyer and the change that fixes each: bathtub or curbed shower -> curbless
 roll-in shower, toilet without support -> grab bars beside it, stairs -> stairlift, narrow door -> wider door, step at
 entry -> ramp, carpet -> hard floor, high counters/cabinets -> roll-under. Always fix an existing object you can see;
 never invent a new fixture in empty floor space. Ignore reflections in mirrors, glass and windows: only real objects.
-box_2d must enclose that existing object (for a tub: the whole tub and its surround) with a little margin.
+Prioritize modest relevant changes: lever hardware for dexterity, lighting or contrast for low vision,
+visual alerts for hearing access, quiet-room or soft-close changes for sensory needs, and simple supports for balance.
+Never infer one kind of disability from another. Flag required width, stair and approach conflicts as fit concerns to
+confirm. Do not offer to widen, move, or demolish a doorway by default. If the buyer requests structural work,
+label it structural, explain the impact briefly and let them choose. Never claim compliance or unverified dimensions.
+If a sink or vanity is described as wheelchair inaccessible, first address forward approach and knee/toe clearance.
+Pick scope "roll_under_sink" for that change. {ROLL_UNDER}
+If the buyer wants all cabinets removed, design an open counter and basin with discreet supports, fully clear
+below. Do not add side cabinets, doors, shelves, plinths or furniture-style frames.
+box_2d must tightly enclose the real fixture, including its existing countertop and cabinet, without adjacent fixtures.
+For a roll-under sink also give edit_box_2d covering only the cabinet below the basin and the immediate floor
+inside the opening. Exclude the basin, faucet, mirror and countertop.
+Use edit_polygon_2d for irregular cabinet silhouettes. Trace the cabinet edges and immediately exposed floor
+with 4–12 [y,x] points in the same coordinate scale as the box. Keep adjacent walls and existing floor outside.
 Return JSON {{"findings":[{{"view": int, "box_2d":[ymin,xmin,ymax,xmax] on a 0-1000 scale,
+  "scope":"roll_under_sink"|"general", "edit_box_2d":[ymin,xmin,ymax,xmax] on the same scale or null,
+  "edit_polygon_2d":[[y,x], [y,x], ...] on the same scale or null,
+  "clear_cabinet": true|false (whether the buyer specifically requested clearing the entire base),
+  "object_id": str|null, "kind": str, "effort": "simple"|"installation"|"structural",
   "item": str, "issue": str, "action":"remove"|"add"|"replace","title":str,"reason":str,
   "fits_needs": true|false (does this help the buyer's stated needs?),
   "advice": str (one friendly sentence: why it matters, or a gentle warning if it is an extra that adds cost without helping their needs),
@@ -250,17 +287,68 @@ At most one finding per view; skip views with nothing important. At most {min(4,
     return _as_obj(ask(prompt, [("image/jpeg", v) for v in views]), "findings")
 
 
-def verify_render(before: bytes, after: bytes, task: str) -> dict:
+def identify_objects(views: list[bytes]) -> dict:
+    prompt = """Inventory the visible physical objects in each room photo for an accessibility tour.
+Include fixtures, furniture, thresholds, controls, lights, passageways and structural features.
+Record independent parts separately: vanity, countertop, basin, faucet, cabinet below the basin;
+door, door handle, threshold; shower, controls, shower head, seat, grab bar; switches, outlets and rails.
+Return a parent id when the part belongs to another detected object. Record separate instances of the
+same kind. Use tight boxes and skip uncertain detections, occluders, drawings, and reflections.
+Kinds should be short snake_case names (faucet, door_handle, vanity_cabinet, sink_basin, countertop,
+shower, shower_control, threshold, light_switch).
+Return JSON {"views":[{"view":0,"objects":[{"id":"a","kind":"faucet","label":"Sink faucet",
+"parent":null,"box_2d":[130,210,260,340],"confidence":0.92}]}]}. Index images from zero.
+Boxes use [ymin,xmin,ymax,xmax] from 0 to 1000. Up to 40 useful objects per view."""
+    return _as_obj(ask(prompt, [("image/jpeg", image) for image in views]), "views")
+
+
+def locate_angles(source: bytes, views: list[tuple[bytes, list]], item: str, scope: str,
+                  observations: list | None = None, clear_cabinet: bool = False) -> dict:
+    prompt = f"""Locate the exact same physical {item} across photographs of one 3D scan.
+Image 1 is the original view with a magenta outline around the target. Images 2 onwards are unedited
+photographs from different camera positions. The scan's rough projected target boxes for those images,
+in order, are {json.dumps([box for _, box in views])}. All boxes use [ymin,xmin,ymax,xmax] from 0 to 1000.
+Use wall/floor junctions, countertops, fixtures and the projected position to confirm identity. The box
+is a hint and may overlap a wall, doorway or mirror. Never target a mirror reflection, another fixture,
+or anything behind a wall. Skip an angle if the real fixture is cut off, blocked, or uncertain.
+Recognized components in candidate views: {json.dumps(observations or [])}
+Return one entry per usable angle, with zero-based view indexing among the candidate images (image 2 = 0).
+Use a tight box_2d around the existing physical item. Scope is {scope}. For roll_under_sink, edit_box_2d must
+cover only the visible cabinet below the basin and the immediate floor inside that opening. Exclude the
+countertop, faucet, surrounding walls and foreground door frames. Skip side views with no visible cabinet
+face to modify. For other scopes set edit_box_2d to null.
+Entire base cabinet removal under the countertop requested: {clear_cabinet}. If true, include the entire
+visible base and no pixels above the underside of the original countertop in edit_box_2d.
+Include edit_polygon_2d as 4–12 [y,x] points tracing the cabinet and immediately revealed floor when the
+base has angled sides. Exclude neighboring walls and floor already visible. Use null if unsure.
+Return JSON {{"angles":[{{"view":0,"box_2d":[0,0,0,0],"edit_box_2d":null,"edit_polygon_2d":null}}]}}."""
+    return _as_obj(ask(prompt, [("image/jpeg", source)] + [("image/jpeg", image) for image, _ in views]), "angles")
+
+
+def verify_render(before: bytes, after: bytes, task: str, reference: bytes | None = None) -> dict:
     """Quality gate: does the edited photo really show the requested change, finished and believable?"""
     prompt = f"""You are a strict reviewer of photo edits for a home-remodel visualizer.
 Image 1 = the original photo region, image 2 = the edited region. The requested change was:
 "{task}"
-Judge only what a home buyer would see. Fail it if: the requested change is missing or only partly done, the old item
+Image 1 is authoritative for camera angle, layout, and original fixture position. If supplied, image 3
+is a design reference from another angle. Compare the design only, never its position in the photograph.
+Fail if the fixture is duplicated, moved along a wall, moved to a different wall, rotated, resized,
+or moved vertically without the task asking for that. Compare the edges of the counter, position of
+the faucet, wall/floor junctions, vanishing points and foreground doorframes between before and after.
+For roll-under sinks, require a clear, finished opening for forward knee and toe approach under the actual basin,
+with protected plumbing set back. The basin and countertop stay fixed. A dark cubby, intact bottom shelf,
+obstructing pipe, or an opening off to the side does not solve this request.
+Fail if the requested change is missing or only partly done, the old item
 is still clearly there when it should be gone, it looks like a construction site, there are smears, warped geometry,
 floating objects, duplicated fixtures, cut-off items at the edges, or obvious seams.
+Fail new smeared or blurred floor bands, broken plank or tile lines, or steps introduced by the edit.
+Ignore scan artifacts already in the original that are outside the edited region.
+If all base cabinets were to be removed, fail a partial opening or remaining furniture frame.
 Return JSON {{"ok": true|false, "score": 0-10, "issues": [str], "fix": str (one concrete instruction to fix it, or "")}}.
 ok must be true only if score >= 7."""
     imgs = [("image/jpeg", before), ("image/jpeg", after)]
+    if reference:
+        imgs.append(("image/png", reference))
     errors = []
     # OpenAI reviews first (an independent model from the one that drew it); Gemini as fallback
     for fn, ok in ((_openai, os.environ.get("OPENAI_API_KEY")), (_gemini, os.environ.get("GCP_PROJECT"))):
@@ -273,7 +361,7 @@ ok must be true only if score >= 7."""
             return res
         except Exception as e:
             errors.append(f"{fn.__name__}: {e}")
-    return {"ok": True, "score": None, "issues": [], "fix": "", "reviewer": "unavailable", "error": "; ".join(errors)[:300]}
+    return {"ok": False, "score": None, "issues": [], "fix": "", "reviewer": "unavailable", "error": "; ".join(errors)[:300]}
 
 
 def chat(home: dict, edits: list, selection: dict | None, message: str, history: list) -> dict:
@@ -286,6 +374,9 @@ Planned changes: {json.dumps(edits)}
 Current selection: {json.dumps(selection) if selection else 'none'}
 Conversation: {json.dumps(history[-8:])}
 User: {message}
-Answer concisely and concretely (costs, trade-offs). Never claim legal ADA compliance; say "likely" and suggest verifying.
+Your name is Sandra. Answer concisely and concretely. If the buyer says a suggestion is too expensive,
+invasive or complex, ask one focused question about the budget or which part they want to keep. Do not
+pretend an edit has been requested or completed. Prefer reversible hardware and equipment when they fit
+the stated need. Never claim legal ADA compliance; say "likely" and suggest verifying.
 Return JSON {{"reply": str}}"""
     return _as_obj(ask(prompt), "reply")

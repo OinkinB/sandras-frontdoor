@@ -1,6 +1,9 @@
 """JSON API: search, home details, 3D selection analysis, chat, aerial view."""
 import base64
+import hashlib
+import json
 import re
+from uuid import uuid4
 
 from flask import Blueprint, Response, abort, current_app, jsonify, request
 
@@ -29,12 +32,27 @@ def _keyword_filters(q: str) -> dict:
         needs += ["walk_in_shower"]
     if re.search(r"elderly|senior|aging|grab", ql):
         needs += ["grab_bars", "first_floor_bedroom"]
+    for key, pattern in {
+        "lever_handles": r"lever handle|arthritis|dexterity",
+        "visual_alerts": r"deaf|hard.of.hearing|visual alarm|flashing doorbell",
+        "even_lighting": r"low vision|glare|even lighting",
+        "quiet_space": r"sensory|noise sensitive|quiet room|soundproof",
+    }.items():
+        if re.search(pattern, ql):
+            needs.append(key)
     m = re.search(r"\$?\s?(\d[\d,]*)\s*(k|m)?", ql.split("under")[-1]) if "under" in ql else None
     price = None
     if m:
         price = float(m.group(1).replace(",", "")) * {"k": 1e3, "m": 1e6}.get(m.group(2) or "", 1)
     city = "Houston" if "houston" in ql else "Los Angeles" if ("los angeles" in ql or " la" in ql) else None
-    return {"needs": list(dict.fromkeys(needs)), "max_price": price, "city": city,
+    required = []
+    for key, pattern in {"no_stairs": r"no stairs|no interior steps|single.level|one.story",
+                         "wide_doorways": r"wide door", "step_free_entry": r"step.free entry|no steps to (?:the )?(?:door|entrance)",
+                         "first_floor_bedroom": r"(?:main|first)[- ]floor bedroom"}.items():
+        if re.search(pattern, ql):
+            required.append(key)
+            needs.append(key)
+    return {"needs": list(dict.fromkeys(needs)), "required": required, "max_price": price, "city": city,
             "rent": True if "rent" in ql else None, "min_beds": None,
             "summary": "keyword search", "persona": ""}
 
@@ -50,7 +68,11 @@ def search():
         except Exception as e:
             current_app.logger.warning("AI parse failed, using keywords: %s", e)
             filters = _keyword_filters(q)
+    if body.get("rent") is True:
+        filters = {**filters, "rent": True}
     needs = [n for n in filters.get("needs") or [] if n in listings.NEEDS]
+    required = [n for n in dict.fromkeys(filters.get("required") or []) if n in listings.NEEDS]
+    needs = list(dict.fromkeys(needs + required))
     rent = filters.get("rent")
     out = []
     for h in listings.HOMES.values():
@@ -62,14 +84,19 @@ def search():
             continue  # default to homes for sale
         if filters.get("city") and h["city"] != filters["city"]:
             continue
-        if filters.get("max_price") and h["price"] > filters["max_price"] * 1.08:
+        if filters.get("max_price") and h["price"] > filters["max_price"]:
             continue
         if filters.get("min_beds") and (h["beds"] or 0) < filters["min_beds"]:
             continue
-        s = listings.score(h, needs)
-        out.append(listings.public(h, s))
-    out.sort(key=lambda x: (-x["match"], x["mod_total"], x["true_cost"]))
-    return jsonify({"filters": {**filters, "needs": needs}, "count": len(out), "results": out[:24],
+        states = {key: h["evidence"].get(key, {}).get("status", "unknown") for key in required}
+        if "no" in states.values():
+            continue
+        row = listings.public(h, listings.score(h, needs))
+        row["required_unconfirmed"] = [key for key, status in states.items() if status != "yes"]
+        row["required_unknown"] = sum(status == "unknown" for status in states.values())
+        out.append(row)
+    out.sort(key=lambda x: (len(x["required_unconfirmed"]), x["required_unknown"], -x["match"], x["mod_total"], x["true_cost"]))
+    return jsonify({"filters": {**filters, "needs": needs, "required": required}, "count": len(out), "results": out[:24],
                     "need_labels": listings.NEEDS})
 
 
@@ -130,6 +157,13 @@ def _renders_dir(home_id):
     return current_app.config["CACHE_DIR"] / "renders" / str(home_id)
 
 
+def _render_reference(out_dir, rid):
+    if not isinstance(rid, str) or not re.fullmatch(r"[0-9a-f]{12}", rid):
+        return None
+    f = out_dir / f"{rid}_ref.png"
+    return f.read_bytes() if f.is_file() else None
+
+
 @bp.post("/home/<int:home_id>/analyze")
 def analyze(home_id):
     _home(home_id)
@@ -151,12 +185,11 @@ def render(home_id):
     _home(home_id)
     b = request.get_json(force=True)
     out_dir = _renders_dir(home_id)
-    ref = None
-    if b.get("ref") and re.fullmatch(r"[0-9a-f]{12}", b["ref"]):
-        f = out_dir / f"{b['ref']}_ref.png"
-        ref = f.read_bytes() if f.exists() else None
     try:
+        ref = _render_reference(out_dir, b.get("ref"))
         task = b["task"] + (f" IMPORTANT FIX from review of the previous attempt: {b['fix']}" if b.get("fix") else "")
+        if b.get("scope") == "roll_under_sink":
+            task += " " + ai.ROLL_UNDER
         meta = imaging.render(_b64img(b["image"]), b["rect"], task, out_dir, ref, b.get("poly"))
     except Exception as e:
         current_app.logger.error("Render error on %s: %s", request.path, e)
@@ -187,10 +220,13 @@ def verify(home_id):
     d = _renders_dir(home_id)
     try:
         before, after = imaging.crop_pair(d, rid)
-        res = ai.verify_render(before, after, b.get("task", ""))
+        task = b.get("task", "")
+        if b.get("scope") == "roll_under_sink":
+            task += " " + ai.ROLL_UNDER
+        res = ai.verify_render(before, after, task, _render_reference(d, b.get("ref")))
     except Exception as e:
         current_app.logger.error("Verify error: %s", e)
-        res = {"ok": True, "score": None, "issues": [], "fix": "", "error": str(e)[:200]}
+        res = {"ok": False, "score": None, "issues": [], "fix": "", "error": str(e)[:200]}
     current_app.logger.info("verify %s -> %s", rid, res)
     return jsonify(res)
 
@@ -203,13 +239,93 @@ def agent_plan(home_id):
     views = [_b64img(v["image"]) for v in b.get("views") or []][:8]
     try:
         res = ai.agent_plan(views, [v.get("room", "") for v in b.get("views") or []], b.get("needs") or [], b.get("persona", ""),
-                           b.get("instruction", ""), bool(b.get("outlined")), b.get("existing") or [], b.get("declined") or [])
+                           b.get("instruction", ""), bool(b.get("outlined")), b.get("existing") or [],
+                           b.get("declined") or [], (b.get("inventory") or [])[:8], str(b.get("preferences", ""))[:1000])
     except Exception as e:
         current_app.logger.error("AI error on %s: %s", request.path, e)
         return jsonify({"error": f"AI unavailable: {e}"[:300]}), 502
     for f in res.get("findings") or []:
         _price_options(f)
     return jsonify(res)
+
+
+@bp.post("/home/<int:home_id>/agent/locate-angles")
+def locate_angles(home_id):
+    """Locate the anchored target in a batch of unedited camera angles."""
+    _home(home_id)
+    b = request.get_json(force=True)
+    try:
+        views = [(_b64img(view["image"]), view["hint"]) for view in b["views"][:4]]
+        if not views:
+            return jsonify({"angles": []})
+        observations = [[{k: obj.get(k) for k in ("kind", "box_2d", "object_id")} for obj in v.get("objects", [])[:40]]
+                        for v in b["views"][:4]]
+        return jsonify(ai.locate_angles(_b64img(b["source"]), views, b["item"], b.get("scope", "general"),
+                                       observations, bool(b.get("clear_cabinet"))))
+    except Exception as e:
+        current_app.logger.warning("Angle localization failed: %s", e)
+        return jsonify({"error": "Could not confirm the fixture in nearby views."}), 502
+
+
+def _stable_objects(objects):
+    results = []
+    used = set()
+    for obj in objects[:40]:
+        if not isinstance(obj, dict):
+            continue
+        box = obj.get("box_2d")
+        label = str(obj.get("label") or "").strip()[:90]
+        kind = re.sub(r"[^a-z0-9]+", "_", str(obj.get("kind") or "").lower()).strip("_")[:45]
+        ident = str(obj.get("id") or "")[:30]
+        confidence = obj.get("confidence")
+        if not (ident and ident not in used and kind and label and isinstance(confidence, (int, float))
+                and 0.52 <= confidence <= 1 and isinstance(box, list) and len(box) == 4
+                and all(isinstance(n, (int, float)) and 0 <= n <= 1000 for n in box)
+                and box[0] < box[2] and box[1] < box[3]):
+            continue
+        used.add(ident)
+        results.append(dict(id=ident, kind=kind, label=label, box_2d=box, confidence=confidence,
+                            parent=str(obj.get("parent") or "")[:30] or None))
+    return results
+
+
+@bp.post("/home/<int:home_id>/agent/objects")
+def objects(home_id):
+    """Reuse detections for a registered camera angle. Store coordinates and labels only."""
+    _home(home_id)
+    body = request.get_json(force=True)
+    folder = current_app.config["CACHE_DIR"] / "objects-v1" / str(home_id)
+    folder.mkdir(exist_ok=True, parents=True)
+    result, missing = [], []
+    try:
+        for i, view in enumerate(body["views"][:4]):
+            key = str(view["key"])[:180]
+            path = folder / (hashlib.sha256(key.encode()).hexdigest() + ".json")
+            try:
+                row = json.loads(path.read_text(encoding="utf8"))
+                result.append({"view": i, "objects": row})
+            except (FileNotFoundError, ValueError):
+                missing.append((i, path, _b64img(view["image"])))
+        if missing:
+            detected = ai.identify_objects([entry[2] for entry in missing])
+            for row in (detected.get("views") or []):
+                index = row.get("view") if isinstance(row, dict) else None
+                if not isinstance(index, int) or not 0 <= index < len(missing):
+                    continue
+                i, path, _ = missing[index]
+                objects = _stable_objects(row.get("objects") or [])
+                temp = path.with_suffix(f".{uuid4().hex}.tmp")
+                try:
+                    temp.write_text(json.dumps(objects), encoding="utf8")
+                    temp.replace(path)
+                finally:
+                    temp.unlink(missing_ok=True)
+                result.append({"view": i, "objects": objects})
+    except Exception as e:
+        current_app.logger.warning("Object indexing failed for home %s: %s", home_id, e)
+        if not result:
+            return jsonify({"error": "This view could not be indexed yet."}), 502
+    return jsonify({"views": sorted(result, key=lambda row: row["view"])})
 
 
 @bp.post("/home/<int:home_id>/chat")

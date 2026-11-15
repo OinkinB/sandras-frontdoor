@@ -22,6 +22,10 @@ NEEDS = {
     "first_floor_bedroom": "Bedroom + bath on main floor",
     "smooth_flooring": "Smooth hard flooring",
     "garage": "Garage / covered parking",
+    "lever_handles": "Lever door handles",
+    "visual_alerts": "Visual doorbell or alarms",
+    "even_lighting": "Even, glare-controlled lighting",
+    "quiet_space": "Quiet room or sound insulation",
 }
 
 # (need, status, regex) checked against remarks + feature lines, first match wins per need.
@@ -29,12 +33,18 @@ RULES = [
     ("walk_in_shower", "yes", r"(walk|roll)[- ]in shower|curbless|zero[- ]threshold shower|barrier[- ]free shower"),
     ("walk_in_shower", "no", r"bathtub with shower|tub/shower|shower over tub|garden tub"),
     ("grab_bars", "yes", r"grab bars?"),
-    ("step_free_entry", "yes", r"\bramp(ed)?\b|no[- ]step|zero[- ]step|step[- ]free|zero[- ]entry|wheelchair accessible|level entry"),
-    ("wide_doorways", "yes", r"wide(r|ned)? (door|hall)|36[- ]?(in|inch|\")[^.]{0,15}door|wheelchair accessible|ada (compliant|accessible)"),
+    ("step_free_entry", "yes", r"no[- ]step entry|zero[- ]step entry|step[- ]free entry|zero[- ]entry|level entry"),
+    ("step_free_entry", "likely", r"\bramp(ed)?\b|wheelchair accessible"),
+    ("wide_doorways", "yes", r"36[- ]?(in|inch|\")[^.]{0,15}door"),
+    ("wide_doorways", "likely", r"wide(r|ned)? (door|hall)|wheelchair accessible"),
     ("first_floor_bedroom", "yes", r"(primary|master|owner'?s?) (bedroom|suite|retreat)[^.]{0,40}(down|first floor|1st floor|main (level|floor)|ground floor)|(first|1st|main)[- ](floor|level) (primary|master|bedroom)|bedroom on main"),
     ("smooth_flooring", "no", r"\bcarpet"),
     ("smooth_flooring", "yes", r"tile flooring|vinyl|laminate|hardwood|wood floor|luxury vinyl|polished concrete|engineered wood"),
     ("garage", "yes", r"garage|carport"),
+    ("lever_handles", "yes", r"\blever (door handles?|handlesets?|hardware)\b"),
+    ("visual_alerts", "yes", r"\b(visual (doorbell|alarm)|strobe (alarm|doorbell))\b"),
+    ("even_lighting", "yes", r"\b(glare[- ]free lighting|diffused lighting|dimmable lighting)\b"),
+    ("quiet_space", "yes", r"\b(soundproof(ed|ing)? room|acoustic insulation|sound attenuat\w+)\b"),
 ]
 
 
